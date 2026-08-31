@@ -1,0 +1,28 @@
+# Default
+* text=auto
+
+# Python
+*.py text eol=lf
+
+# Notebooks
+*.ipynb text eol=lf
+
+# Documentation
+*.md text eol=lf
+*.txt text eol=lf
+
+# Configuration
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+
+# CSV / data files
+*.csv text eol=lf
+
+# GeoJSON
+*.geojson text eol=lf
+
+# Windows-specific scripts
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

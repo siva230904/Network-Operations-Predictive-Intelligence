@@ -1,0 +1,2588 @@
+Performance.py
+# =========================================================
+# SP5 — Performance & Execution Behaviour
+# File: phase2/sp5/performance.py
+# =========================================================
+
+import json
+import logging
+import time
+from pathlib import Path
+
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
+from pyspark import StorageLevel
+
+
+# =========================================================
+# Logging
+# =========================================================
+
+def create_logger(log_dir="../../data/logs"):
+    """
+    Create a unique SP5 log file.
+
+    Existing logs are never overwritten.
+    """
+
+    log_path = Path(log_dir)
+
+    log_path.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    run_number = 1
+
+    while True:
+
+        filename = (
+            log_path
+            / f"sp5_performance_run_{run_number:03d}.log"
+        )
+
+        if not filename.exists():
+            break
+
+        run_number += 1
+
+    logger = logging.getLogger(
+        f"SP5_{run_number}"
+    )
+
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    formatter = logging.Formatter(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(message)s"
+    )
+
+    handler = logging.FileHandler(
+        filename,
+        encoding="utf-8"
+    )
+
+    handler.setFormatter(formatter)
+
+    logger.addHandler(handler)
+
+    return logger, filename
+
+
+# =========================================================
+# Performance Analyzer
+# =========================================================
+
+class PerformanceAnalyzer:
+    """
+    SP5 — Performance and execution behaviour.
+
+    SP5 consumes the existing SP4 Parquet checkpoint.
+
+    Main input:
+
+        data/landing/sp4/grid_activity_geo
+
+    The lab deliberately focuses on evidence:
+
+        explain()
+        action timings
+        partition counts
+        column pruning
+        broadcast join plans
+
+    No blanket optimization pass is performed.
+    """
+
+    REQUIRED_COLUMNS = [
+        "timestamp",
+        "grid_id",
+        "sms_in",
+        "sms_out",
+        "call_in",
+        "call_out",
+        "internet_activity",
+        "total_activity",
+        "geometry",
+    ]
+
+    ACTIVITY_COLUMNS = [
+        "sms_in",
+        "sms_out",
+        "call_in",
+        "call_out",
+        "internet_activity",
+        "total_activity",
+    ]
+
+    # =====================================================
+    # Constructor
+    # =====================================================
+
+    def __init__(
+        self,
+        spark,
+        sp4_geo_df: DataFrame,
+        output_dir="../../data/landing/sp5",
+        log_dir="../../data/logs"
+    ):
+
+        if spark is None:
+
+            raise ValueError(
+                "spark cannot be None."
+            )
+
+        if sp4_geo_df is None:
+
+            raise ValueError(
+                "sp4_geo_df cannot be None."
+            )
+
+        self.spark = spark
+
+        self.sp4_geo_df = sp4_geo_df
+
+        self.output_dir = Path(
+            output_dir
+        )
+
+        self.output_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        self.logger, self.log_file = (
+            create_logger(log_dir)
+        )
+
+        # -------------------------------------------------
+        # Counts
+        # -------------------------------------------------
+
+        self.input_row_count = None
+
+        self.input_partition_count = None
+
+        # -------------------------------------------------
+        # Results
+        # -------------------------------------------------
+
+        self.hotspot_result = None
+
+        self.baseline_timing = None
+
+        self.cached_timing = None
+
+        self.partition_observation = None
+
+        self.repartitioned_df = None
+
+        self.column_pruned_df = None
+
+        self.broadcast_join = None
+
+        self.standard_join = None
+
+        self.performance_observations = []
+
+        self.acceptance = None
+
+        # -------------------------------------------------
+        # Reports
+        # -------------------------------------------------
+
+        self.report = None
+
+    # =====================================================
+    # 1. Validate inputs
+    # =====================================================
+
+    def validate_inputs(self):
+
+        missing = [
+            column
+            for column in self.REQUIRED_COLUMNS
+            if column not in self.sp4_geo_df.columns
+        ]
+
+        if missing:
+
+            raise ValueError(
+                "SP4 checkpoint missing required "
+                f"columns: {missing}"
+            )
+
+        self.input_row_count = (
+            self.sp4_geo_df.count()
+        )
+
+        if self.input_row_count == 0:
+
+            raise ValueError(
+                "SP4 checkpoint contains zero rows."
+            )
+
+        self.input_partition_count = (
+            self.sp4_geo_df.rdd
+            .getNumPartitions()
+        )
+
+        self.logger.info(
+            "SP5 input validation passed."
+        )
+
+        self.logger.info(
+            "Input rows: %d",
+            self.input_row_count
+        )
+
+        self.logger.info(
+            "Input partitions: %d",
+            self.input_partition_count
+        )
+
+    # =====================================================
+    # 2. Hotspot aggregation
+    # =====================================================
+
+    def run_hotspot_explain(self):
+
+        """
+        Run explain() on the hotspot aggregation.
+
+        This is diagnostic evidence for the lab.
+        """
+
+        hotspot = (
+            self.sp4_geo_df
+            .groupBy("grid_id")
+            .agg(
+                F.sum(
+                    "total_activity"
+                ).alias(
+                    "total_activity"
+                )
+            )
+            .orderBy(
+                F.desc("total_activity")
+            )
+            .limit(10)
+        )
+
+        self.hotspot_result = hotspot
+
+        print("\n" + "=" * 70)
+        print("SP5 — HOTSPOT AGGREGATION PHYSICAL PLAN")
+        print("=" * 70)
+
+        hotspot.explain(
+            mode="formatted"
+        )
+
+        self.logger.info(
+            "Displayed physical plan for hotspot aggregation."
+        )
+
+        return hotspot
+
+    # =====================================================
+    # 3. Baseline action timing
+    # =====================================================
+
+    def _run_timed_action(
+        self,
+        df,
+        action_name
+    ):
+
+        start = time.perf_counter()
+
+        result = (
+            df.count()
+        )
+
+        elapsed = (
+            time.perf_counter()
+            -
+            start
+        )
+
+        self.logger.info(
+            "%s: rows=%d, elapsed=%.4f seconds",
+            action_name,
+            result,
+            elapsed
+        )
+
+        return {
+            "action":
+                action_name,
+
+            "rows":
+                result,
+
+            "seconds":
+                elapsed
+        }
+
+    # =====================================================
+    # 4. Cache timing experiment
+    # =====================================================
+
+    def compare_cache_timings(self):
+
+        """
+        Compare repeated actions before and after caching.
+
+        The experiment deliberately uses the same DataFrame
+        for both actions.
+        """
+
+        print("\n" + "=" * 70)
+        print("SP5 — CACHE TIMING EXPERIMENT")
+        print("=" * 70)
+
+        # -------------------------------------------------
+        # Baseline
+        # -------------------------------------------------
+
+        baseline_1 = (
+            self._run_timed_action(
+                self.sp4_geo_df,
+                "baseline_action_1"
+            )
+        )
+
+        baseline_2 = (
+            self._run_timed_action(
+                self.sp4_geo_df,
+                "baseline_action_2"
+            )
+        )
+
+        # -------------------------------------------------
+        # Cache
+        # -------------------------------------------------
+
+        cached_df = (
+            self.sp4_geo_df
+            .persist(
+                StorageLevel.MEMORY_AND_DISK
+            )
+        )
+
+        cache_materialization = (
+            self._run_timed_action(
+                cached_df,
+                "cache_materialization"
+            )
+        )
+
+        cached_1 = (
+            self._run_timed_action(
+                cached_df,
+                "cached_action_1"
+            )
+        )
+
+        cached_2 = (
+            self._run_timed_action(
+                cached_df,
+                "cached_action_2"
+            )
+        )
+
+        # -------------------------------------------------
+        # Unpersist after experiment
+        # -------------------------------------------------
+
+        cached_df.unpersist()
+
+        self.baseline_timing = {
+            "action_1_seconds":
+                baseline_1["seconds"],
+
+            "action_2_seconds":
+                baseline_2["seconds"],
+
+            "average_seconds":
+                (
+                    baseline_1["seconds"]
+                    +
+                    baseline_2["seconds"]
+                )
+                /
+                2.0
+        }
+
+        self.cached_timing = {
+            "materialization_seconds":
+                cache_materialization["seconds"],
+
+            "action_1_seconds":
+                cached_1["seconds"],
+
+            "action_2_seconds":
+                cached_2["seconds"],
+
+            "average_seconds":
+                (
+                    cached_1["seconds"]
+                    +
+                    cached_2["seconds"]
+                )
+                /
+                2.0
+        }
+
+        baseline_average = (
+            self.baseline_timing[
+                "average_seconds"
+            ]
+        )
+
+        cached_average = (
+            self.cached_timing[
+                "average_seconds"
+            ]
+        )
+
+        if baseline_average > 0:
+
+            improvement_percentage = (
+                (
+                    baseline_average
+                    -
+                    cached_average
+                )
+                /
+                baseline_average
+                *
+                100.0
+            )
+
+        else:
+
+            improvement_percentage = 0.0
+
+        self.cached_timing[
+            "average_improvement_percentage"
+        ] = improvement_percentage
+
+        print(
+            f"\nBaseline action 1: "
+            f"{baseline_1['seconds']:.4f}s"
+        )
+
+        print(
+            f"Baseline action 2: "
+            f"{baseline_2['seconds']:.4f}s"
+        )
+
+        print(
+            f"Cached action 1:   "
+            f"{cached_1['seconds']:.4f}s"
+        )
+
+        print(
+            f"Cached action 2:   "
+            f"{cached_2['seconds']:.4f}s"
+        )
+
+        print(
+            f"\nAverage baseline: "
+            f"{baseline_average:.4f}s"
+        )
+
+        print(
+            f"Average cached:   "
+            f"{cached_average:.4f}s"
+        )
+
+        print(
+            f"Observed change:  "
+            f"{improvement_percentage:.2f}%"
+        )
+
+        self.logger.info(
+            "Cache timing experiment completed."
+        )
+
+        return {
+            "baseline":
+                self.baseline_timing,
+
+            "cached":
+                self.cached_timing
+        }
+
+    # =====================================================
+    # 5. Partition inspection
+    # =====================================================
+
+    def inspect_partitions(self):
+
+        current_partitions = (
+            self.sp4_geo_df.rdd
+            .getNumPartitions()
+        )
+
+        print("\n" + "=" * 70)
+        print("SP5 — PARTITION INSPECTION")
+        print("=" * 70)
+
+        print(
+            f"Current partitions: "
+            f"{current_partitions}"
+        )
+
+        self.partition_observation = {
+            "input_partitions":
+                current_partitions
+        }
+
+        self.logger.info(
+            "Current SP4 partition count: %d",
+            current_partitions
+        )
+
+        return current_partitions
+
+    # =====================================================
+    # 6. Repartition by date
+    # =====================================================
+
+    def test_repartition_by_date(self):
+
+        """
+        Diagnostic repartition experiment.
+
+        Repartitioning is NOT automatically treated as
+        an optimization.
+
+        The purpose is to observe partition count and
+        physical plan behaviour.
+        """
+
+        if "date" in self.sp4_geo_df.columns:
+
+            date_df = self.sp4_geo_df
+
+        else:
+
+            date_df = (
+                self.sp4_geo_df
+                .withColumn(
+                    "date",
+                    F.to_date(
+                        "timestamp"
+                    )
+                )
+            )
+
+        repartitioned = (
+            date_df
+            .repartition(
+                "date"
+            )
+        )
+
+        repartitioned_count = (
+            repartitioned.rdd
+            .getNumPartitions()
+        )
+
+        self.repartitioned_df = (
+            repartitioned
+        )
+
+        self.partition_observation[
+            "repartitioned_by_date_partitions"
+        ] = repartitioned_count
+
+        print("\n" + "=" * 70)
+        print("SP5 — REPARTITION BY DATE")
+        print("=" * 70)
+
+        print(
+            f"Before repartition: "
+            f"{self.partition_observation['input_partitions']}"
+        )
+
+        print(
+            f"After repartition by date: "
+            f"{repartitioned_count}"
+        )
+
+        repartitioned.explain(
+            mode="formatted"
+        )
+
+        self.logger.info(
+            "Repartition-by-date diagnostic completed."
+        )
+
+        return repartitioned
+
+    # =====================================================
+    # 7. Column pruning
+    # =====================================================
+
+    def demonstrate_column_pruning(self):
+
+        """
+        Select only the columns needed for hotspot
+        aggregation.
+
+        Geometry is deliberately excluded.
+        """
+
+        required_for_hotspots = [
+            "grid_id",
+            "total_activity"
+        ]
+
+        self.column_pruned_df = (
+            self.sp4_geo_df
+            .select(
+                *required_for_hotspots
+            )
+        )
+
+        print("\n" + "=" * 70)
+        print("SP5 — COLUMN PRUNING")
+        print("=" * 70)
+
+        print(
+            "Columns before pruning:"
+        )
+
+        print(
+            self.sp4_geo_df.columns
+        )
+
+        print(
+            "\nColumns after pruning:"
+        )
+
+        print(
+            self.column_pruned_df.columns
+        )
+
+        pruned_hotspots = (
+            self.column_pruned_df
+            .groupBy("grid_id")
+            .agg(
+                F.sum(
+                    "total_activity"
+                ).alias(
+                    "total_activity"
+                )
+            )
+            .orderBy(
+                F.desc("total_activity")
+            )
+            .limit(10)
+        )
+
+        print(
+            "\nPhysical plan after column pruning:"
+        )
+
+        pruned_hotspots.explain(
+            mode="formatted"
+        )
+
+        self.logger.info(
+            "Column pruning diagnostic completed."
+        )
+
+        return pruned_hotspots
+
+    # =====================================================
+    # 8. Broadcast join experiment
+    # =====================================================
+
+    def create_small_grid_lookup(self):
+
+        """
+        Create a small lookup from the geometry already
+        present in SP4.
+
+        This represents the static grid reference used
+        during SP4.
+        """
+
+        lookup = (
+            self.sp4_geo_df
+            .select(
+                "grid_id",
+                "geometry"
+            )
+            .dropDuplicates(
+                ["grid_id"]
+            )
+        )
+
+        return lookup
+
+    # =====================================================
+    # 9. Standard vs broadcast join
+    # =====================================================
+
+    def compare_join_plans(self):
+
+        """
+        Compare standard and broadcast join physical plans.
+
+        No blanket optimization is applied to the whole
+        SP5 input.
+        """
+
+        activity = (
+            self.sp4_geo_df
+            .select(
+                "timestamp",
+                "grid_id",
+                "total_activity"
+            )
+        )
+
+        grid_lookup = (
+            self.create_small_grid_lookup()
+        )
+
+        self.standard_join = (
+            activity
+            .join(
+                grid_lookup,
+                on="grid_id",
+                how="left"
+            )
+        )
+
+        self.broadcast_join = (
+            activity
+            .join(
+                F.broadcast(
+                    grid_lookup
+                ),
+                on="grid_id",
+                how="left"
+            )
+        )
+
+        print("\n" + "=" * 70)
+        print("SP5 — STANDARD JOIN PLAN")
+        print("=" * 70)
+
+        self.standard_join.explain(
+            mode="formatted"
+        )
+
+        print("\n" + "=" * 70)
+        print("SP5 — BROADCAST JOIN PLAN")
+        print("=" * 70)
+
+        self.broadcast_join.explain(
+            mode="formatted"
+        )
+
+        self.logger.info(
+            "Standard and broadcast join plans compared."
+        )
+
+        return {
+            "standard":
+                self.standard_join,
+
+            "broadcast":
+                self.broadcast_join
+        }
+
+    # =====================================================
+    # 10. Performance observations
+    # =====================================================
+
+    def document_observations(self):
+
+        """
+        Create three evidence-based observations.
+
+        These are observations of this run, not universal
+        claims about Spark performance.
+        """
+
+        baseline_average = (
+            self.baseline_timing[
+                "average_seconds"
+            ]
+        )
+
+        cached_average = (
+            self.cached_timing[
+                "average_seconds"
+            ]
+        )
+
+        cache_change = (
+            self.cached_timing[
+                "average_improvement_percentage"
+            ]
+        )
+
+        input_partitions = (
+            self.partition_observation[
+                "input_partitions"
+            ]
+        )
+
+        repartitioned_partitions = (
+            self.partition_observation[
+                "repartitioned_by_date_partitions"
+            ]
+        )
+
+        # -------------------------------------------------
+        # Observation 1 — cache
+        # -------------------------------------------------
+
+        observation_1 = {
+            "observation":
+                "Caching changed the timing of repeated actions.",
+
+            "evidence": {
+                "baseline_average_seconds":
+                    baseline_average,
+
+                "cached_average_seconds":
+                    cached_average,
+
+                "observed_percentage_change":
+                    cache_change
+            },
+
+            "interpretation":
+                (
+                    "The timing difference is the evidence "
+                    "for whether reuse benefits this workload. "
+                    "Caching is justified only when the "
+                    "DataFrame is reused enough to offset "
+                    "materialization and memory/storage cost."
+                )
+        }
+
+        # -------------------------------------------------
+        # Observation 2 — repartition
+        # -------------------------------------------------
+
+        observation_2 = {
+            "observation":
+                "Repartitioning by date changes the partitioning "
+                "and introduces a shuffle boundary.",
+
+            "evidence": {
+                "input_partitions":
+                    input_partitions,
+
+                "repartitioned_by_date_partitions":
+                    repartitioned_partitions
+            },
+
+            "interpretation":
+                (
+                    "The repartition operation is not automatically "
+                    "an optimization. A shuffle costs work, so it "
+                    "should only be retained when later operations "
+                    "benefit enough from the resulting partitioning."
+                )
+        }
+
+        # -------------------------------------------------
+        # Observation 3 — column pruning
+        # -------------------------------------------------
+
+        original_column_count = (
+            len(
+                self.sp4_geo_df.columns
+            )
+        )
+
+        pruned_column_count = (
+            len(
+                self.column_pruned_df.columns
+            )
+        )
+
+        observation_3 = {
+            "observation":
+                "Column pruning removes geometry and other "
+                "unused fields before hotspot aggregation.",
+
+            "evidence": {
+                "columns_before":
+                    original_column_count,
+
+                "columns_after":
+                    pruned_column_count,
+
+                "selected_columns":
+                    self.column_pruned_df.columns
+            },
+
+            "interpretation":
+                (
+                    "The hotspot aggregation needs only grid_id "
+                    "and total_activity. Selecting only those "
+                    "columns reduces the data carried into the "
+                    "aggregation and provides a concrete example "
+                    "of column pruning."
+                )
+        }
+
+        self.performance_observations = [
+            observation_1,
+            observation_2,
+            observation_3
+        ]
+
+        for index, observation in enumerate(
+            self.performance_observations,
+            start=1
+        ):
+
+            self.logger.info(
+                "Performance observation %d: %s",
+                index,
+                observation["observation"]
+            )
+
+        return self.performance_observations
+
+    # =====================================================
+    # 11. Explicitly reject one optimization
+    # =====================================================
+
+    def document_rejected_optimization(self):
+
+        """
+        SP5 requires at least one suggested optimization
+        to be rejected with a reason.
+
+        We reject forcing a large number of partitions
+        on this local training workload.
+        """
+
+        rejection = {
+            "optimization":
+                "Aggressively over-partition the dataset.",
+
+            "decision":
+                "REJECT",
+
+            "reason":
+                (
+                    "The dataset is being processed locally "
+                    "for a training workload. Increasing "
+                    "partition count without evidence of "
+                    "parallelism or skew problems can add "
+                    "task scheduling and shuffle overhead. "
+                    "The lab asks for evidence before applying "
+                    "optimizations, so no arbitrary partition "
+                    "count is imposed."
+                ),
+
+            "evidence_to_monitor": [
+                "input partition count",
+                "task duration",
+                "shuffle read",
+                "shuffle write",
+                "stage/task overhead"
+            ]
+        }
+
+        self.logger.info(
+            "Rejected optimization: "
+            "aggressive over-partitioning."
+        )
+
+        return rejection
+
+    # =====================================================
+    # 12. Build optimized transformation
+    # =====================================================
+
+    def build_optimized_hotspot_transformation(self):
+
+        """
+        Minimal evidence-based transformation:
+
+        column pruning before hotspot aggregation.
+
+        No arbitrary repartition is forced here.
+        """
+
+        optimized = (
+            self.sp4_geo_df
+            .select(
+                "grid_id",
+                "total_activity"
+            )
+            .groupBy(
+                "grid_id"
+            )
+            .agg(
+                F.sum(
+                    "total_activity"
+                ).alias(
+                    "total_activity"
+                )
+            )
+            .orderBy(
+                F.desc("total_activity")
+            )
+            .limit(10)
+        )
+
+        return optimized
+
+    # =====================================================
+    # 13. Validate SP5 outputs
+    # =====================================================
+
+    def validate_outputs(self):
+
+        results = {}
+
+        # -------------------------------------------------
+        # Criterion 1
+        # -------------------------------------------------
+
+        results[
+            "three_observations"
+        ] = (
+            len(
+                self.performance_observations
+            )
+            >=
+            3
+        )
+
+        # -------------------------------------------------
+        # Criterion 2
+        # -------------------------------------------------
+
+        rejection = (
+            self.document_rejected_optimization()
+        )
+
+        results[
+            "rejected_optimization"
+        ] = (
+            rejection["decision"]
+            ==
+            "REJECT"
+        )
+
+        # -------------------------------------------------
+        # Criterion 3
+        # -------------------------------------------------
+
+        results[
+            "cache_timing_captured"
+        ] = (
+            self.baseline_timing is not None
+            and
+            self.cached_timing is not None
+            and
+            "action_1_seconds"
+            in
+            self.baseline_timing
+            and
+            "action_2_seconds"
+            in
+            self.baseline_timing
+            and
+            "action_1_seconds"
+            in
+            self.cached_timing
+            and
+            "action_2_seconds"
+            in
+            self.cached_timing
+        )
+
+        all_passed = all(
+            results.values()
+        )
+
+        print("\n" + "=" * 70)
+        print("SP5 ACCEPTANCE CRITERIA")
+        print("=" * 70)
+
+        print(
+            "\n1. THREE PERFORMANCE OBSERVATIONS"
+        )
+
+        print(
+            "PASS"
+            if results[
+                "three_observations"
+            ]
+            else
+            "FAIL"
+        )
+
+        print(
+            "\n2. AT LEAST ONE OPTIMIZATION REJECTED"
+        )
+
+        print(
+            "PASS"
+            if results[
+                "rejected_optimization"
+            ]
+            else
+            "FAIL"
+        )
+
+        print(
+            "\n3. BEFORE/AFTER CACHE TIMING"
+        )
+
+        print(
+            "PASS"
+            if results[
+                "cache_timing_captured"
+            ]
+            else
+            "FAIL"
+        )
+
+        print("\n" + "=" * 70)
+
+        if all_passed:
+
+            print(
+                "SP5 AUTOMATED ACCEPTANCE: ALL PASS"
+            )
+
+        else:
+
+            print(
+                "SP5 AUTOMATED ACCEPTANCE: FAILED"
+            )
+
+        print("=" * 70)
+
+        self.acceptance = {
+            "all_passed":
+                all_passed,
+
+            "criteria":
+                results
+        }
+
+        return self.acceptance
+
+    # =====================================================
+    # 14. Export reports
+    # =====================================================
+
+    def export_outputs(self):
+
+        output_path = (
+            self.output_dir
+        )
+
+        # -------------------------------------------------
+        # Optimized hotspot output
+        # -------------------------------------------------
+
+        optimized_hotspots = (
+            self.build_optimized_hotspot_transformation()
+        )
+
+        hotspot_parquet = (
+            output_path
+            /
+            "optimized_hotspot_ranking"
+        )
+
+        hotspot_csv = (
+            output_path
+            /
+            "optimized_hotspot_ranking_csv"
+        )
+
+        (
+            optimized_hotspots
+            .write
+            .mode("overwrite")
+            .parquet(
+                str(hotspot_parquet)
+            )
+        )
+
+        (
+            optimized_hotspots
+            .write
+            .mode("overwrite")
+            .option(
+                "header",
+                True
+            )
+            .csv(
+                str(hotspot_csv)
+            )
+        )
+
+        # -------------------------------------------------
+        # Performance report
+        # -------------------------------------------------
+
+        self.report = {
+            "input": {
+                "rows":
+                    self.input_row_count,
+
+                "partitions":
+                    self.input_partition_count,
+
+                "columns":
+                    self.sp4_geo_df.columns
+            },
+
+            "cache_timing":
+                self.cached_timing,
+
+            "baseline_timing":
+                self.baseline_timing,
+
+            "partition_observation":
+                self.partition_observation,
+
+            "performance_observations":
+                self.performance_observations,
+
+            "rejected_optimization":
+                self.document_rejected_optimization(),
+
+            "acceptance":
+                self.acceptance,
+
+            "outputs": {
+                "optimized_hotspot_parquet":
+                    str(hotspot_parquet),
+
+                "optimized_hotspot_csv":
+                    str(hotspot_csv)
+            }
+        }
+
+        report_json = (
+            output_path
+            /
+            "sp5_performance_report.json"
+        )
+
+        with open(
+            report_json,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            json.dump(
+                self.report,
+                file,
+                indent=4
+            )
+
+        # -------------------------------------------------
+        # Human-readable notes
+        # -------------------------------------------------
+
+        notes_file = (
+            output_path
+            /
+            "sp5_performance_observations.txt"
+        )
+
+        with open(
+            notes_file,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            file.write(
+                "SP5 — PERFORMANCE OBSERVATIONS\n"
+            )
+
+            file.write(
+                "=" * 70
+                +
+                "\n\n"
+            )
+
+            for index, observation in enumerate(
+                self.performance_observations,
+                start=1
+            ):
+
+                file.write(
+                    f"OBSERVATION {index}\n"
+                )
+
+                file.write(
+                    f"{observation['observation']}\n\n"
+                )
+
+                file.write(
+                    "Evidence:\n"
+                )
+
+                for key, value in (
+                    observation[
+                        "evidence"
+                    ].items()
+                ):
+
+                    file.write(
+                        f"  {key}: {value}\n"
+                    )
+
+                file.write(
+                    "\nInterpretation:\n"
+                )
+
+                file.write(
+                    "  "
+                    +
+                    observation[
+                        "interpretation"
+                    ]
+                    +
+                    "\n\n"
+                )
+
+            rejection = (
+                self.document_rejected_optimization()
+            )
+
+            file.write(
+                "REJECTED OPTIMIZATION\n"
+            )
+
+            file.write(
+                f"{rejection['optimization']}\n"
+            )
+
+            file.write(
+                f"Decision: {rejection['decision']}\n\n"
+            )
+
+            file.write(
+                rejection["reason"]
+                +
+                "\n"
+            )
+
+        self.logger.info(
+            "SP5 reports exported to %s",
+            output_path
+        )
+
+        return {
+            "optimized_hotspot_parquet":
+                hotspot_parquet,
+
+            "optimized_hotspot_csv":
+                hotspot_csv,
+
+            "performance_report":
+                report_json,
+
+            "observations":
+                notes_file
+        }
+
+    # =====================================================
+    # 15. Full pipeline
+    # =====================================================
+
+    def process(self):
+
+        self.logger.info(
+            "Starting SP5 performance analysis."
+        )
+
+        # -------------------------------------------------
+        # Input
+        # -------------------------------------------------
+
+        self.validate_inputs()
+
+        # -------------------------------------------------
+        # Activity 1
+        # -------------------------------------------------
+
+        self.run_hotspot_explain()
+
+        # -------------------------------------------------
+        # Activity 2
+        # -------------------------------------------------
+
+        self.compare_cache_timings()
+
+        # -------------------------------------------------
+        # Activity 3
+        # -------------------------------------------------
+
+        self.inspect_partitions()
+
+        self.test_repartition_by_date()
+
+        # -------------------------------------------------
+        # Activity 4
+        # -------------------------------------------------
+
+        self.demonstrate_column_pruning()
+
+        # -------------------------------------------------
+        # Activity 5
+        # -------------------------------------------------
+
+        self.compare_join_plans()
+
+        # -------------------------------------------------
+        # Activity 7
+        # -------------------------------------------------
+
+        self.document_observations()
+
+        # -------------------------------------------------
+        # Acceptance
+        # -------------------------------------------------
+
+        acceptance = (
+            self.validate_outputs()
+        )
+
+        if not acceptance[
+            "all_passed"
+        ]:
+
+            self.logger.error(
+                "SP5 acceptance criteria failed."
+            )
+
+            raise ValueError(
+                "SP5 acceptance criteria failed."
+            )
+
+        # -------------------------------------------------
+        # Export
+        # -------------------------------------------------
+
+        output_paths = (
+            self.export_outputs()
+        )
+
+        self.logger.info(
+            "SP5 performance analysis completed."
+        )
+
+        return {
+            "acceptance":
+                acceptance,
+
+            "performance_observations":
+                self.performance_observations,
+
+            "baseline_timing":
+                self.baseline_timing,
+
+            "cached_timing":
+                self.cached_timing,
+
+            "partition_observation":
+                self.partition_observation,
+
+            "output_paths":
+                output_paths,
+
+            "log_file":
+                self.log_file
+        }
+
+
+sp5_run_test.py
+
+# =========================================================
+# SP5 Runner
+# File: phase2/sp5/sp5_run_test.py
+# =========================================================
+
+import os
+import sys
+
+# ---------------------------------------------------------
+# Ensure Spark uses the same Python interpreter
+# ---------------------------------------------------------
+
+python_path = sys.executable
+
+os.environ[
+    "PYSPARK_PYTHON"
+] = python_path
+
+os.environ[
+    "PYSPARK_DRIVER_PYTHON"
+] = python_path
+
+
+# =========================================================
+# Imports
+# =========================================================
+
+from pathlib import Path
+
+from pyspark.sql import SparkSession
+
+from performance import PerformanceAnalyzer
+
+
+# =========================================================
+# Project paths
+# =========================================================
+
+BASE_DIR = (
+    Path(__file__)
+    .resolve()
+    .parents[2]
+)
+
+
+# =========================================================
+# SP4 Parquet checkpoint
+# =========================================================
+
+SP4_CHECKPOINT = (
+    BASE_DIR
+    / "data"
+    / "landing"
+    / "sp4"
+    / "grid_activity_geo"
+)
+
+
+# =========================================================
+# SP5 output
+# =========================================================
+
+OUTPUT_DIR = (
+    BASE_DIR
+    / "data"
+    / "landing"
+    / "sp5"
+)
+
+
+# =========================================================
+# Logs
+# =========================================================
+
+LOG_DIR = (
+    BASE_DIR
+    / "data"
+    / "logs"
+)
+
+
+# =========================================================
+# Spark
+# =========================================================
+
+spark = (
+    SparkSession
+    .builder
+    .appName(
+        "SP5-Performance-Analysis"
+    )
+    .getOrCreate()
+)
+
+spark.sparkContext.setLogLevel(
+    "WARN"
+)
+
+
+try:
+
+    # =====================================================
+    # 1. Validate checkpoint
+    # =====================================================
+
+    print("\n" + "=" * 70)
+    print("SP5 INPUT")
+    print("=" * 70)
+
+    print(
+        f"SP4 Parquet checkpoint:\n"
+        f"{SP4_CHECKPOINT}"
+    )
+
+    if not SP4_CHECKPOINT.exists():
+
+        raise FileNotFoundError(
+            "SP4 Parquet checkpoint not found:\n"
+            f"{SP4_CHECKPOINT}"
+        )
+
+    # =====================================================
+    # 2. Load SP4 Parquet
+    # =====================================================
+
+    print("\n" + "=" * 70)
+    print("LOADING SP4 PARQUET CHECKPOINT")
+    print("=" * 70)
+
+    sp4_geo_df = (
+        spark.read
+        .parquet(
+            str(SP4_CHECKPOINT)
+        )
+    )
+
+    row_count = (
+        sp4_geo_df.count()
+    )
+
+    partition_count = (
+        sp4_geo_df.rdd
+        .getNumPartitions()
+    )
+
+    print(
+        f"SP4 rows       : "
+        f"{row_count:,}"
+    )
+
+    print(
+        f"SP4 partitions : "
+        f"{partition_count}"
+    )
+
+    # =====================================================
+    # 3. Schema
+    # =====================================================
+
+    print("\n" + "=" * 70)
+    print("SP4 INPUT SCHEMA")
+    print("=" * 70)
+
+    sp4_geo_df.printSchema()
+
+    print("\nColumns:")
+
+    for column in (
+        sp4_geo_df.columns
+    ):
+
+        print(
+            f"  {column}"
+        )
+
+    # =====================================================
+    # 4. Performance analyzer
+    # =====================================================
+
+    analyzer = PerformanceAnalyzer(
+        spark=spark,
+        sp4_geo_df=sp4_geo_df,
+        output_dir=OUTPUT_DIR,
+        log_dir=LOG_DIR
+    )
+
+    # =====================================================
+    # 5. Run SP5
+    # =====================================================
+
+    result = (
+        analyzer.process()
+    )
+
+    # =====================================================
+    # 6. Final results
+    # =====================================================
+
+    print("\n" + "=" * 70)
+    print("SP5 COMPLETED")
+    print("=" * 70)
+
+    # -----------------------------------------------------
+    # Cache timing
+    # -----------------------------------------------------
+
+    print(
+        "\nCACHE TIMING"
+    )
+
+    baseline = (
+        result[
+            "baseline_timing"
+        ]
+    )
+
+    cached = (
+        result[
+            "cached_timing"
+        ]
+    )
+
+    print(
+        f"Baseline action 1 : "
+        f"{baseline['action_1_seconds']:.4f}s"
+    )
+
+    print(
+        f"Baseline action 2 : "
+        f"{baseline['action_2_seconds']:.4f}s"
+    )
+
+    print(
+        f"Cached action 1   : "
+        f"{cached['action_1_seconds']:.4f}s"
+    )
+
+    print(
+        f"Cached action 2   : "
+        f"{cached['action_2_seconds']:.4f}s"
+    )
+
+    print(
+        f"Average change    : "
+        f"{cached['average_improvement_percentage']:.2f}%"
+    )
+
+    # -----------------------------------------------------
+    # Partition observation
+    # -----------------------------------------------------
+
+    print(
+        "\nPARTITIONS"
+    )
+
+    partitions = (
+        result[
+            "partition_observation"
+        ]
+    )
+
+    print(
+        f"Input partitions          : "
+        f"{partitions['input_partitions']}"
+    )
+
+    print(
+        f"After repartition by date : "
+        f"{partitions['repartitioned_by_date_partitions']}"
+    )
+
+    # -----------------------------------------------------
+    # Performance observations
+    # -----------------------------------------------------
+
+    print(
+        "\nPERFORMANCE OBSERVATIONS"
+    )
+
+    for index, observation in enumerate(
+        result[
+            "performance_observations"
+        ],
+        start=1
+    ):
+
+        print(
+            f"\nObservation {index}: "
+            f"{observation['observation']}"
+        )
+
+        print(
+            "Evidence:"
+        )
+
+        for key, value in (
+            observation[
+                "evidence"
+            ].items()
+        ):
+
+            print(
+                f"  {key}: {value}"
+            )
+
+    # -----------------------------------------------------
+    # Acceptance
+    # -----------------------------------------------------
+
+    print(
+        "\n" + "=" * 70
+    )
+
+    acceptance = (
+        result[
+            "acceptance"
+        ]
+    )
+
+    if acceptance[
+        "all_passed"
+    ]:
+
+        print(
+            "SP5 ACCEPTANCE: ALL PASS"
+        )
+
+    else:
+
+        print(
+            "SP5 ACCEPTANCE: FAILED"
+        )
+
+    print(
+        "=" * 70
+    )
+
+    # -----------------------------------------------------
+    # Outputs
+    # -----------------------------------------------------
+
+    print(
+        "\nOutputs:"
+    )
+
+    for name, path in (
+        result[
+            "output_paths"
+        ].items()
+    ):
+
+        print(
+            f"  {name}: {path}"
+        )
+
+    # -----------------------------------------------------
+    # Log
+    # -----------------------------------------------------
+
+    print(
+        f"\nLog file:\n"
+        f"  {result['log_file']}"
+    )
+
+    print("\n" + "=" * 70)
+    print("SP5 RUN FINISHED SUCCESSFULLY")
+    print("=" * 70)
+
+
+finally:
+
+    spark.stop()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+output:
+
+PS D:\Project1\phase2\sp5> python sp5_run_test.py
+WARNING: Using incubator modules: jdk.incubator.vector
+Using Spark's default log4j profile: org/apache/spark/log4j2-defaults.properties
+Setting default log level to "WARN".
+To adjust logging level use sc.setLogLevel(newLevel). For SparkR, use setLogLevel(newLevel).
+C:\Users\siva.manikandan\AppData\Local\Programs\Python\Python312\Lib\site-packages\pyspark\testing\utils.py:127: FutureWarning: PySpark does not yet fully support pandas >= 3.0.0. Some features may not work correctly. It is recommended to use pandas < 3.0.0 for now.
+  require_minimum_pandas_version()
+
+======================================================================
+SP5 INPUT
+======================================================================
+SP4 Parquet checkpoint:
+D:\Project1\data\landing\sp4\grid_activity_geo
+
+======================================================================
+LOADING SP4 PARQUET CHECKPOINT
+======================================================================
+SP4 rows       : 1,679,994                                                      
+SP4 partitions : 15
+
+======================================================================
+SP4 INPUT SCHEMA
+======================================================================
+root
+ |-- grid_id: integer (nullable = true)
+ |-- timestamp: timestamp (nullable = true)
+ |-- sms_in: double (nullable = true)
+ |-- sms_out: double (nullable = true)
+ |-- call_in: double (nullable = true)
+ |-- call_out: double (nullable = true)
+ |-- internet_activity: double (nullable = true)
+ |-- total_sms: double (nullable = true)
+ |-- total_calls: double (nullable = true)
+ |-- total_activity: double (nullable = true)
+ |-- internet_share: double (nullable = true)
+ |-- date: date (nullable = true)
+ |-- hour: integer (nullable = true)
+ |-- day_of_week: integer (nullable = true)
+ |-- geometry: string (nullable = true)
+
+
+Columns:
+  grid_id
+  timestamp
+  sms_in
+  sms_out
+  call_in
+  call_out
+  internet_activity
+  total_sms
+  total_calls
+  total_activity
+  internet_share
+  date
+  hour
+  day_of_week
+  geometry
+
+======================================================================
+SP5 — HOTSPOT AGGREGATION PHYSICAL PLAN
+======================================================================
+== Physical Plan ==
+AdaptiveSparkPlan (6)
++- TakeOrderedAndProject (5)
+   +- HashAggregate (4)
+      +- Exchange (3)
+         +- HashAggregate (2)
+            +- Scan parquet  (1)
+
+
+(1) Scan parquet 
+Output [2]: [grid_id#0, total_activity#9]
+Batched: true
+Location: InMemoryFileIndex [file:/D:/Project1/data/landing/sp4/grid_activity_geo]
+ReadSchema: struct<grid_id:int,total_activity:double>
+
+(2) HashAggregate
+Input [2]: [grid_id#0, total_activity#9]
+Keys [1]: [grid_id#0]
+Functions [1]: [partial_sum(total_activity#9)]
+Aggregate Attributes [1]: [sum#71]
+Results [2]: [grid_id#0, sum#72]
+
+(3) Exchange
+Input [2]: [grid_id#0, sum#72]
+Arguments: hashpartitioning(grid_id#0, 200), ENSURE_REQUIREMENTS, [plan_id=93]
+
+(4) HashAggregate
+Input [2]: [grid_id#0, sum#72]
+Keys [1]: [grid_id#0]
+Functions [1]: [sum(total_activity#9)]
+Aggregate Attributes [1]: [sum(total_activity#9)#69]
+Results [2]: [grid_id#0, sum(total_activity#9)#69 AS total_activity#53]
+
+(5) TakeOrderedAndProject
+Input [2]: [grid_id#0, total_activity#53]
+Arguments: 10, [total_activity#53 DESC NULLS LAST], [grid_id#0, total_activity#53]
+
+(6) AdaptiveSparkPlan
+Output [2]: [grid_id#0, total_activity#53]
+Arguments: isFinalPlan=false
+
+
+
+======================================================================
+SP5 — CACHE TIMING EXPERIMENT
+======================================================================
+[26.400s][warning][gc,alloc] Executor task launch worker for task 7.0 in stage 13.0 (TID 72): Retried waiting for GCLocker too often allocating 320002 words
+[26.400s][warning][gc,alloc] Executor task launch worker for task 8.0 in stage 13.0 (TID 73): Retried waiting for GCLocker too often allocating 287563 words
+[26.407s][warning][gc,alloc] Executor task launch worker for task 6.0 in stage 13.0 (TID 71): Retried waiting for GCLocker too often allocating 16277 words
+[26.411s][warning][gc,alloc] Executor task launch worker for task 0.0 in stage 13.0 (TID 65): Retried waiting for GCLocker too often allocating 13235 words
+[26.411s][warning][gc,alloc] Executor task launch worker for task 2.0 in stage 13.0 (TID 67): Retried waiting for GCLocker too often allocating 160002 words
+[26.432s][warning][gc,alloc] Executor task launch worker for task 13.0 in stage 13.0 (TID 78): Retried waiting for GCLocker too often allocating 320002 words
+[26.432s][warning][gc,alloc] Executor task launch worker for task 8.0 in stage 13.0 (TID 73): Retried waiting for GCLocker too often allocating 13381 words
+[26.432s][warning][gc,alloc] Executor task launch worker for task 11.0 in stage 13.0 (TID 76): Retried waiting for GCLocker too often allocating 17705 words
+[26.447s][warning][gc,alloc] Executor task launch worker for task 10.0 in stage 13.0 (TID 75): Retried waiting for GCLocker too often allocating 15834 words
+[26.447s][warning][gc,alloc] Executor task launch worker for task 7.0 in stage 13.0 (TID 72): Retried waiting for GCLocker too often allocating 18808 words
+[26.447s][warning][gc,alloc] Executor task launch worker for task 4.0 in stage 13.0 (TID 69): Retried waiting for GCLocker too often allocating 14064 words
+[26.447s][warning][gc,alloc] Executor task launch worker for task 12.0 in stage 13.0 (TID 77): Retried waiting for GCLocker too often allocating 11603 words
+[26.447s][warning][gc,alloc] Executor task launch worker for task 9.0 in stage 13.0 (TID 74): Retried waiting for GCLocker too often allocating 10002 words
+[26.447s][warning][gc,alloc] Executor task launch worker for task 3.0 in stage 13.0 (TID 68): Retried waiting for GCLocker too often allocating 17710 words
+[26.463s][warning][gc,alloc] Executor task launch worker for task 6.0 in stage 13.0 (TID 71): Retried waiting for GCLocker too often allocating 2 words
+[26.463s][warning][gc,alloc] Executor task launch worker for task 5.0 in stage 13.0 (TID 70): Retried waiting for GCLocker too often allocating 12074 words
+[26.486s][warning][gc,alloc] Executor task launch worker for task 4.0 in stage 13.0 (TID 69): Retried waiting for GCLocker too often allocating 131074 words
+[26.486s][warning][gc,alloc] Executor task launch worker for task 3.0 in stage 13.0 (TID 68): Retried waiting for GCLocker too often allocating 187411 words
+[26.490s][warning][gc,alloc] Executor task launch worker for task 10.0 in stage 13.0 (TID 75): Retried waiting for GCLocker too often allocating 287571 words
+26/08/30 21:51:14 WARN BlockManager: Block rdd_40_8 could not be removed as it was not found on disk or in memory
+26/08/30 21:51:14 WARN BlockManager: Block rdd_40_3 could not be removed as it was not found on disk or in memory
+26/08/30 21:51:14 WARN BlockManager: Block rdd_40_6 could not be removed as it was not found on disk or in memory
+26/08/30 21:51:14 WARN BlockManager: Block rdd_40_9 could not be removed as it was not found on disk or in memory
+26/08/30 21:51:14 WARN BlockManager: Block rdd_40_13 could not be removed as it was not found on disk or in memory
+26/08/30 21:51:14 ERROR Executor: Exception in task 8.0 in stage 13.0 (TID 73)
+java.lang.OutOfMemoryError: Java heap space
+        at java.base/java.nio.HeapByteBuffer.<init>(HeapByteBuffer.java:64)
+        at java.base/java.nio.ByteBuffer.allocate(ByteBuffer.java:363)
+        at org.apache.spark.sql.execution.columnar.BasicColumnBuilder.build(ColumnBuilder.scala:81)
+        at org.apache.spark.sql.execution.columnar.NativeColumnBuilder.org$apache$spark$sql$execution$columnar$NullableColumnBuilder$$super$build(ColumnBuilder.scala:99)
+        at org.apache.spark.sql.execution.columnar.NullableColumnBuilder.buildNonNulls(NullableColumnBuilder.scala:86)
+        at org.apache.spark.sql.execution.columnar.NullableColumnBuilder.buildNonNulls$(NullableColumnBuilder.scala:84)
+        at org.apache.spark.sql.execution.columnar.NativeColumnBuilder.buildNonNulls(ColumnBuilder.scala:99)
+        at org.apache.spark.sql.execution.columnar.compression.CompressibleColumnBuilder.build(CompressibleColumnBuilder.scala:85)
+        at org.apache.spark.sql.execution.columnar.compression.CompressibleColumnBuilder.build$(CompressibleColumnBuilder.scala:84)
+        at org.apache.spark.sql.execution.columnar.NativeColumnBuilder.build(ColumnBuilder.scala:99)
+        at org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer$$anon$1.$anonfun$next$5(InMemoryRelation.scala:166)
+        at org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer$$anon$1$$Lambda$4929/0x0000016e0208b110.apply(Unknown Source)
+        at scala.collection.ArrayOps$.map$extension(ArrayOps.scala:936)
+        at org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer$$anon$1.next(InMemoryRelation.scala:165)
+        at org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer$$anon$1.next(InMemoryRelation.scala:131)
+        at org.apache.spark.sql.execution.columnar.CachedRDDBuilder$$anon$2.next(InMemoryRelation.scala:387)
+        at org.apache.spark.sql.execution.columnar.CachedRDDBuilder$$anon$2.next(InMemoryRelation.scala:384)
+        at org.apache.spark.storage.memory.MemoryStore.putIterator(MemoryStore.scala:232)
+        at org.apache.spark.storage.memory.MemoryStore.putIteratorAsBytes(MemoryStore.scala:368)
+        at org.apache.spark.storage.BlockManager.$anonfun$doPutIterator$1(BlockManager.scala:1709)
+        at org.apache.spark.storage.BlockManager$$Lambda$2134/0x0000016e01c42d28.apply(Unknown Source)
+        at org.apache.spark.storage.BlockManager.org$apache$spark$storage$BlockManager$$doPut(BlockManager.scala:1618)
+        at org.apache.spark.storage.BlockManager.doPutIterator(BlockManager.scala:1683)
+        at org.apache.spark.storage.BlockManager.getOrElseUpdate(BlockManager.scala:1462)
+        at org.apache.spark.storage.BlockManager.getOrElseUpdateRDDBlock(BlockManager.scala:1416)
+        at org.apache.spark.rdd.RDD.getOrCompute(RDD.scala:386)
+        at org.apache.spark.rdd.RDD.iterator(RDD.scala:336)
+        at org.apache.spark.scheduler.ResultTask.runTask(ResultTask.scala:93)
+        at org.apache.spark.TaskContext.runTaskWithListeners(TaskContext.scala:206)
+        at org.apache.spark.scheduler.Task.run(Task.scala:147)
+        at org.apache.spark.executor.Executor$TaskRunner.$anonfun$run$4(Executor.scala:894)
+        at org.apache.spark.executor.Executor$TaskRunner$$Lambda$2268/0x0000016e01c8b080.apply(Unknown Source)
+26/08/30 21:51:14 ERROR Executor: Exception in task 6.0 in stage 13.0 (TID 71)
+java.lang.OutOfMemoryError: Java heap space
+26/08/30 21:51:14 ERROR Executor: Exception in task 3.0 in stage 13.0 (TID 68)
+java.lang.OutOfMemoryError: Java heap space
+26/08/30 21:51:14 WARN BlockManager: Block rdd_40_7 could not be removed as it was not found on disk or in memory
+26/08/30 21:51:14 WARN BlockManager: Block rdd_40_10 could not be removed as it was not found on disk or in memory
+26/08/30 21:51:14 WARN BlockManager: Block rdd_40_4 could not be removed as it was not found on disk or in memory
+26/08/30 21:51:14 WARN BlockManager: Block rdd_40_2 could not be removed as it was not found on disk or in memory
+26/08/30 21:51:14 ERROR Executor: Exception in task 7.0 in stage 13.0 (TID 72)
+java.lang.OutOfMemoryError: Java heap space
+        at java.base/java.nio.HeapByteBuffer.<init>(HeapByteBuffer.java:64)
+        at java.base/java.nio.ByteBuffer.allocate(ByteBuffer.java:363)
+        at org.apache.spark.sql.execution.columnar.ColumnBuilder$.ensureFreeSpace(ColumnBuilder.scala:171)
+        at org.apache.spark.sql.execution.columnar.BasicColumnBuilder.appendFrom(ColumnBuilder.scala:73)
+        at org.apache.spark.sql.execution.columnar.NativeColumnBuilder.org$apache$spark$sql$execution$columnar$NullableColumnBuilder$$super$appendFrom(ColumnBuilder.scala:99)
+        at org.apache.spark.sql.execution.columnar.NullableColumnBuilder.appendFrom(NullableColumnBuilder.scala:61)
+        at org.apache.spark.sql.execution.columnar.NullableColumnBuilder.appendFrom$(NullableColumnBuilder.scala:54)
+        at org.apache.spark.sql.execution.columnar.NativeColumnBuilder.org$apache$spark$sql$execution$columnar$compression$CompressibleColumnBuilder$$super$appendFrom(ColumnBuilder.scala:99)
+        at org.apache.spark.sql.execution.columnar.compression.CompressibleColumnBuilder.appendFrom(CompressibleColumnBuilder.scala:78)
+        at org.apache.spark.sql.execution.columnar.compression.CompressibleColumnBuilder.appendFrom$(CompressibleColumnBuilder.scala:77)
+        at org.apache.spark.sql.execution.columnar.NativeColumnBuilder.appendFrom(ColumnBuilder.scala:99)
+        at org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer$$anon$1.next(InMemoryRelation.scala:156)
+        at org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer$$anon$1.next(InMemoryRelation.scala:131)
+        at org.apache.spark.sql.execution.columnar.CachedRDDBuilder$$anon$2.next(InMemoryRelation.scala:387)
+        at org.apache.spark.sql.execution.columnar.CachedRDDBuilder$$anon$2.next(InMemoryRelation.scala:384)
+        at org.apache.spark.storage.memory.MemoryStore.putIterator(MemoryStore.scala:232)
+        at org.apache.spark.storage.memory.MemoryStore.putIteratorAsBytes(MemoryStore.scala:368)
+        at org.apache.spark.storage.BlockManager.$anonfun$doPutIterator$1(BlockManager.scala:1709)
+        at org.apache.spark.storage.BlockManager$$Lambda$2134/0x0000016e01c42d28.apply(Unknown Source)
+        at org.apache.spark.storage.BlockManager.org$apache$spark$storage$BlockManager$$doPut(BlockManager.scala:1618)
+        at org.apache.spark.storage.BlockManager.doPutIterator(BlockManager.scala:1683)
+        at org.apache.spark.storage.BlockManager.getOrElseUpdate(BlockManager.scala:1462)
+        at org.apache.spark.storage.BlockManager.getOrElseUpdateRDDBlock(BlockManager.scala:1416)
+        at org.apache.spark.rdd.RDD.getOrCompute(RDD.scala:386)
+        at org.apache.spark.rdd.RDD.iterator(RDD.scala:336)
+        at org.apache.spark.scheduler.ResultTask.runTask(ResultTask.scala:93)
+        at org.apache.spark.TaskContext.runTaskWithListeners(TaskContext.scala:206)
+        at org.apache.spark.scheduler.Task.run(Task.scala:147)
+        at org.apache.spark.executor.Executor$TaskRunner.$anonfun$run$4(Executor.scala:894)
+        at org.apache.spark.executor.Executor$TaskRunner$$Lambda$2268/0x0000016e01c8b080.apply(Unknown Source)
+        at org.apache.spark.util.SparkErrorUtils.tryWithSafeFinally(SparkErrorUtils.scala:86)
+        at org.apache.spark.util.SparkErrorUtils.tryWithSafeFinally$(SparkErrorUtils.scala:83)
+26/08/30 21:51:14 ERROR Executor: Exception in task 13.0 in stage 13.0 (TID 78)
+java.lang.OutOfMemoryError: Java heap space
+26/08/30 21:51:14 ERROR Executor: Exception in task 9.0 in stage 13.0 (TID 74)
+java.lang.OutOfMemoryError: Java heap space
+26/08/30 21:51:14 ERROR Executor: Exception in task 2.0 in stage 13.0 (TID 67)
+java.lang.OutOfMemoryError: Java heap space
+26/08/30 21:51:14 ERROR Executor: Exception in task 4.0 in stage 13.0 (TID 69)
+java.lang.OutOfMemoryError: Java heap space
+26/08/30 21:51:14 ERROR Executor: Exception in task 10.0 in stage 13.0 (TID 75)
+java.lang.OutOfMemoryError: Java heap space
+26/08/30 21:51:14 ERROR SparkUncaughtExceptionHandler: Uncaught exception in thread Thread[Executor task launch worker for task 9.0 in stage 13.0 (TID 74),5,main]
+java.lang.OutOfMemoryError: Java heap space
+26/08/30 21:51:14 ERROR SparkUncaughtExceptionHandler: Uncaught exception in thread Thread[Executor task launch worker for task 13.0 in stage 13.0 (TID 78),5,main]
+java.lang.OutOfMemoryError: Java heap space
+26/08/30 21:51:14 ERROR SparkUncaughtExceptionHandler: Uncaught exception in thread Thread[Executor task launch worker for task 2.0 in stage 13.0 (TID 67),5,main]
+java.lang.OutOfMemoryError: Java heap space
+26/08/30 21:51:14 ERROR SparkUncaughtExceptionHandler: Uncaught exception in thread Thread[Executor task launch worker for task 4.0 in stage 13.0 (TID 69),5,main]
+java.lang.OutOfMemoryError: Java heap space
+26/08/30 21:51:14 ERROR SparkUncaughtExceptionHandler: Uncaught exception in thread Thread[Executor task launch worker for task 6.0 in stage 13.0 (TID 71),5,main]
+java.lang.OutOfMemoryError: Java heap space
+26/08/30 21:51:14 ERROR SparkUncaughtExceptionHandler: Uncaught exception in thread Thread[Executor task launch worker for task 7.0 in stage 13.0 (TID 72),5,main]
+java.lang.OutOfMemoryError: Java heap space
+        at java.base/java.nio.HeapByteBuffer.<init>(HeapByteBuffer.java:64)
+        at java.base/java.nio.ByteBuffer.allocate(ByteBuffer.java:363)
+        at org.apache.spark.sql.execution.columnar.ColumnBuilder$.ensureFreeSpace(ColumnBuilder.scala:171)
+        at org.apache.spark.sql.execution.columnar.BasicColumnBuilder.appendFrom(ColumnBuilder.scala:73)
+        at org.apache.spark.sql.execution.columnar.NativeColumnBuilder.org$apache$spark$sql$execution$columnar$NullableColumnBuilder$$super$appendFrom(ColumnBuilder.scala:99)
+        at org.apache.spark.sql.execution.columnar.NullableColumnBuilder.appendFrom(NullableColumnBuilder.scala:61)
+        at org.apache.spark.sql.execution.columnar.NullableColumnBuilder.appendFrom$(NullableColumnBuilder.scala:54)
+        at org.apache.spark.sql.execution.columnar.NativeColumnBuilder.org$apache$spark$sql$execution$columnar$compression$CompressibleColumnBuilder$$super$appendFrom(ColumnBuilder.scala:99)
+        at org.apache.spark.sql.execution.columnar.compression.CompressibleColumnBuilder.appendFrom(CompressibleColumnBuilder.scala:78)
+        at org.apache.spark.sql.execution.columnar.compression.CompressibleColumnBuilder.appendFrom$(CompressibleColumnBuilder.scala:77)
+        at org.apache.spark.sql.execution.columnar.NativeColumnBuilder.appendFrom(ColumnBuilder.scala:99)
+        at org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer$$anon$1.next(InMemoryRelation.scala:156)
+        at org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer$$anon$1.next(InMemoryRelation.scala:131)
+        at org.apache.spark.sql.execution.columnar.CachedRDDBuilder$$anon$2.next(InMemoryRelation.scala:387)
+        at org.apache.spark.sql.execution.columnar.CachedRDDBuilder$$anon$2.next(InMemoryRelation.scala:384)
+        at org.apache.spark.storage.memory.MemoryStore.putIterator(MemoryStore.scala:232)
+        at org.apache.spark.storage.memory.MemoryStore.putIteratorAsBytes(MemoryStore.scala:368)
+        at org.apache.spark.storage.BlockManager.$anonfun$doPutIterator$1(BlockManager.scala:1709)
+        at org.apache.spark.storage.BlockManager$$Lambda$2134/0x0000016e01c42d28.apply(Unknown Source)
+        at org.apache.spark.storage.BlockManager.org$apache$spark$storage$BlockManager$$doPut(BlockManager.scala:1618)
+        at org.apache.spark.storage.BlockManager.doPutIterator(BlockManager.scala:1683)
+        at org.apache.spark.storage.BlockManager.getOrElseUpdate(BlockManager.scala:1462)
+        at org.apache.spark.storage.BlockManager.getOrElseUpdateRDDBlock(BlockManager.scala:1416)
+        at org.apache.spark.rdd.RDD.getOrCompute(RDD.scala:386)
+        at org.apache.spark.rdd.RDD.iterator(RDD.scala:336)
+        at org.apache.spark.scheduler.ResultTask.runTask(ResultTask.scala:93)
+        at org.apache.spark.TaskContext.runTaskWithListeners(TaskContext.scala:206)
+        at org.apache.spark.scheduler.Task.run(Task.scala:147)
+        at org.apache.spark.executor.Executor$TaskRunner.$anonfun$run$4(Executor.scala:894)
+        at org.apache.spark.executor.Executor$TaskRunner$$Lambda$2268/0x0000016e01c8b080.apply(Unknown Source)
+        at org.apache.spark.util.SparkErrorUtils.tryWithSafeFinally(SparkErrorUtils.scala:86)
+        at org.apache.spark.util.SparkErrorUtils.tryWithSafeFinally$(SparkErrorUtils.scala:83)
+26/08/30 21:51:14 ERROR SparkUncaughtExceptionHandler: Uncaught exception in thread Thread[Executor task launch worker for task 10.0 in stage 13.0 (TID 75),5,main]
+java.lang.OutOfMemoryError: Java heap space
+26/08/30 21:51:14 ERROR SparkUncaughtExceptionHandler: Uncaught exception in thread Thread[Executor task launch worker for task 3.0 in stage 13.0 (TID 68),5,main]
+java.lang.OutOfMemoryError: Java heap space
+26/08/30 21:51:14 ERROR SparkUncaughtExceptionHandler: Uncaught exception in thread Thread[Executor task launch worker for task 8.0 in stage 13.0 (TID 73),5,main]
+java.lang.OutOfMemoryError: Java heap space
+        at java.base/java.nio.HeapByteBuffer.<init>(HeapByteBuffer.java:64)
+        at java.base/java.nio.ByteBuffer.allocate(ByteBuffer.java:363)
+        at org.apache.spark.sql.execution.columnar.BasicColumnBuilder.build(ColumnBuilder.scala:81)
+        at org.apache.spark.sql.execution.columnar.NativeColumnBuilder.org$apache$spark$sql$execution$columnar$NullableColumnBuilder$$super$build(ColumnBuilder.scala:99)
+        at org.apache.spark.sql.execution.columnar.NullableColumnBuilder.buildNonNulls(NullableColumnBuilder.scala:86)
+        at org.apache.spark.sql.execution.columnar.NullableColumnBuilder.buildNonNulls$(NullableColumnBuilder.scala:84)
+        at org.apache.spark.sql.execution.columnar.NativeColumnBuilder.buildNonNulls(ColumnBuilder.scala:99)
+        at org.apache.spark.sql.execution.columnar.compression.CompressibleColumnBuilder.build(CompressibleColumnBuilder.scala:85)
+        at org.apache.spark.sql.execution.columnar.compression.CompressibleColumnBuilder.build$(CompressibleColumnBuilder.scala:84)
+        at org.apache.spark.sql.execution.columnar.NativeColumnBuilder.build(ColumnBuilder.scala:99)
+        at org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer$$anon$1.$anonfun$next$5(InMemoryRelation.scala:166)
+        at org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer$$anon$1$$Lambda$4929/0x0000016e0208b110.apply(Unknown Source)
+        at scala.collection.ArrayOps$.map$extension(ArrayOps.scala:936)
+        at org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer$$anon$1.next(InMemoryRelation.scala:165)
+        at org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer$$anon$1.next(InMemoryRelation.scala:131)
+        at org.apache.spark.sql.execution.columnar.CachedRDDBuilder$$anon$2.next(InMemoryRelation.scala:387)
+        at org.apache.spark.sql.execution.columnar.CachedRDDBuilder$$anon$2.next(InMemoryRelation.scala:384)
+        at org.apache.spark.storage.memory.MemoryStore.putIterator(MemoryStore.scala:232)
+        at org.apache.spark.storage.memory.MemoryStore.putIteratorAsBytes(MemoryStore.scala:368)
+        at org.apache.spark.storage.BlockManager.$anonfun$doPutIterator$1(BlockManager.scala:1709)
+        at org.apache.spark.storage.BlockManager$$Lambda$2134/0x0000016e01c42d28.apply(Unknown Source)
+        at org.apache.spark.storage.BlockManager.org$apache$spark$storage$BlockManager$$doPut(BlockManager.scala:1618)
+        at org.apache.spark.storage.BlockManager.doPutIterator(BlockManager.scala:1683)
+        at org.apache.spark.storage.BlockManager.getOrElseUpdate(BlockManager.scala:1462)
+        at org.apache.spark.storage.BlockManager.getOrElseUpdateRDDBlock(BlockManager.scala:1416)
+        at org.apache.spark.rdd.RDD.getOrCompute(RDD.scala:386)
+        at org.apache.spark.rdd.RDD.iterator(RDD.scala:336)
+        at org.apache.spark.scheduler.ResultTask.runTask(ResultTask.scala:93)
+        at org.apache.spark.TaskContext.runTaskWithListeners(TaskContext.scala:206)
+        at org.apache.spark.scheduler.Task.run(Task.scala:147)
+        at org.apache.spark.executor.Executor$TaskRunner.$anonfun$run$4(Executor.scala:894)
+        at org.apache.spark.executor.Executor$TaskRunner$$Lambda$2268/0x0000016e01c8b080.apply(Unknown Source)
+26/08/30 21:51:14 ERROR Executor: Executor launch task task 14.0 in stage 13.0 (TID 79) failed, reason: Task org.apache.spark.executor.Executor$TaskRunner@30b8ff83 rejected from java.util.concurrent.ThreadPoolExecutor@3936b48d[Shutting down, pool size = 6, active threads = 6, queued tasks = 0, completed tasks = 73]
+26/08/30 21:51:14 WARN TaskSetManager: Lost task 3.0 in stage 13.0 (TID 68) (C8LAP1840.prodapt.com executor driver): java.lang.OutOfMemoryError: Java heap space
+
+26/08/30 21:51:14 ERROR TaskSetManager: Task 3 in stage 13.0 failed 1 times; aborting job
+26/08/30 21:51:15 WARN TaskSetManager: Lost task 14.0 in stage 13.0 (TID 79) (C8LAP1840.prodapt.com executor driver): java.util.concurrent.RejectedExecutionException: Task org.apache.spark.executor.Executor$TaskRunner@30b8ff83 rejected from java.util.concurrent.ThreadPoolExecutor@3936b48d[Shutting down, pool size = 6, active threads = 6, queued tasks = 0, completed tasks = 73]
+        at java.base/java.util.concurrent.ThreadPoolExecutor$AbortPolicy.rejectedExecution(ThreadPoolExecutor.java:2065)
+        at java.base/java.util.concurrent.ThreadPoolExecutor.reject(ThreadPoolExecutor.java:833)
+        at java.base/java.util.concurrent.ThreadPoolExecutor.execute(ThreadPoolExecutor.java:1365)
+        at org.apache.spark.executor.Executor.launchTask(Executor.scala:563)
+        at org.apache.spark.scheduler.local.LocalEndpoint.$anonfun$reviveOffers$1(LocalSchedulerBackend.scala:103)
+        at org.apache.spark.scheduler.local.LocalEndpoint.$anonfun$reviveOffers$1$adapted(LocalSchedulerBackend.scala:101)
+        at scala.collection.immutable.Vector.foreach(Vector.scala:2125)
+        at org.apache.spark.scheduler.local.LocalEndpoint.reviveOffers(LocalSchedulerBackend.scala:101)
+        at org.apache.spark.scheduler.local.LocalEndpoint$$anonfun$receive$1.applyOrElse(LocalSchedulerBackend.scala:78)
+        at org.apache.spark.rpc.netty.Inbox.$anonfun$process$1(Inbox.scala:116)
+        at org.apache.spark.rpc.netty.Inbox.safelyCall(Inbox.scala:216)
+        at org.apache.spark.rpc.netty.Inbox.process(Inbox.scala:101)
+        at org.apache.spark.rpc.netty.MessageLoop.org$apache$spark$rpc$netty$MessageLoop$$receiveLoop(MessageLoop.scala:76)
+        at org.apache.spark.rpc.netty.MessageLoop$$anon$1.run(MessageLoop.scala:42)
+        at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1136)
+        at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:635)
+        at java.base/java.lang.Thread.run(Thread.java:842)
+
+26/08/30 21:51:15 WARN BlockManager: Putting block rdd_40_1 failed due to exception org.apache.spark.TaskKilledException: Stage cancelled: Job aborted due to stage failure: Task 3 in stage 13.0 failed 1 times, most recent failure: Lost task 3.0 in stage 13.0 (TID 68) (C8LAP1840.prodapt.com executor driver): java.lang.OutOfMemoryError: Java heap space
+
+Driver stacktrace:.
+26/08/30 21:51:15 WARN BlockManager: Block rdd_40_1 could not be removed as it was not found on disk or in memory
+26/08/30 21:51:15 WARN BlockManager: Putting block rdd_40_0 failed due to exception org.apache.spark.TaskKilledException: Stage cancelled: Job aborted due to stage failure: Task 3 in stage 13.0 failed 1 times, most recent failure: Lost task 3.0 in stage 13.0 (TID 68) (C8LAP1840.prodapt.com executor driver): java.lang.OutOfMemoryError: Java heap space
+
+Driver stacktrace:.
+26/08/30 21:51:15 WARN BlockManager: Putting block rdd_40_5 failed due to exception org.apache.spark.TaskKilledException: Stage cancelled: Job aborted due to stage failure: Task 3 in stage 13.0 failed 1 times, most recent failure: Lost task 3.0 in stage 13.0 (TID 68) (C8LAP1840.prodapt.com executor driver): java.lang.OutOfMemoryError: Java heap space
+
+Driver stacktrace:.
+26/08/30 21:51:15 WARN BlockManager: Block rdd_40_0 could not be removed as it was not found on disk or in memory
+26/08/30 21:51:15 WARN BlockManager: Block rdd_40_5 could not be removed as it was not found on disk or in memory
+26/08/30 21:51:15 WARN BlockManager: Putting block rdd_40_11 failed due to exception org.apache.spark.TaskKilledException: Stage cancelled: Job aborted due to stage failure: Task 3 in stage 13.0 failed 1 times, most recent failure: Lost task 3.0 in stage 13.0 (TID 68) (C8LAP1840.prodapt.com executor driver): java.lang.OutOfMemoryError: Java heap space
+
+Driver stacktrace:.
+26/08/30 21:51:15 WARN BlockManager: Block rdd_40_11 could not be removed as it was not found on disk or in memory
+26/08/30 21:51:15 WARN BlockManager: Putting block rdd_40_12 failed due to exception org.apache.spark.TaskKilledException: Stage cancelled: Job aborted due to stage failure: Task 3 in stage 13.0 failed 1 times, most recent failure: Lost task 3.0 in stage 13.0 (TID 68) (C8LAP1840.prodapt.com executor driver): java.lang.OutOfMemoryError: Java heap space
+
+Driver stacktrace:.
+26/08/30 21:51:15 ERROR TaskSchedulerImpl: Exception in statusUpdate
+java.util.concurrent.RejectedExecutionException: Task org.apache.spark.scheduler.TaskResultGetter$$Lambda$4984/0x0000016e021671a0@280b0998 rejected from java.util.concurrent.ThreadPoolExecutor@50e3449c[Terminated, pool size = 0, active threads = 0, queued tasks = 0, completed tasks = 75]
+        at java.base/java.util.concurrent.ThreadPoolExecutor$AbortPolicy.rejectedExecution(ThreadPoolExecutor.java:2065)
+        at java.base/java.util.concurrent.ThreadPoolExecutor.reject(ThreadPoolExecutor.java:833)
+        at java.base/java.util.concurrent.ThreadPoolExecutor.execute(ThreadPoolExecutor.java:1365)
+        at org.apache.spark.scheduler.TaskResultGetter.enqueueFailedTask(TaskResultGetter.scala:140)
+        at org.apache.spark.scheduler.TaskSchedulerImpl.statusUpdate(TaskSchedulerImpl.scala:810)
+        at org.apache.spark.scheduler.local.LocalEndpoint$$anonfun$receive$1.applyOrElse(LocalSchedulerBackend.scala:75)
+        at org.apache.spark.rpc.netty.Inbox.$anonfun$process$1(Inbox.scala:116)
+        at org.apache.spark.rpc.netty.Inbox.safelyCall(Inbox.scala:216)
+        at org.apache.spark.rpc.netty.Inbox.process(Inbox.scala:101)
+        at org.apache.spark.rpc.netty.MessageLoop.org$apache$spark$rpc$netty$MessageLoop$$receiveLoop(MessageLoop.scala:76)
+        at org.apache.spark.rpc.netty.MessageLoop$$anon$1.run(MessageLoop.scala:42)
+        at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1136)
+        at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:635)
+        at java.base/java.lang.Thread.run(Thread.java:842)
+26/08/30 21:51:15 WARN BlockManager: Block rdd_40_12 could not be removed as it was not found on disk or in memory
+26/08/30 21:51:15 ERROR TaskSchedulerImpl: Exception in statusUpdate
+java.util.concurrent.RejectedExecutionException: Task org.apache.spark.scheduler.TaskResultGetter$$Lambda$4984/0x0000016e021671a0@48e0fc2d rejected from java.util.concurrent.ThreadPoolExecutor@50e3449c[Terminated, pool size = 0, active threads = 0, queued tasks = 0, completed tasks = 75]
+        at java.base/java.util.concurrent.ThreadPoolExecutor$AbortPolicy.rejectedExecution(ThreadPoolExecutor.java:2065)
+        at java.base/java.util.concurrent.ThreadPoolExecutor.reject(ThreadPoolExecutor.java:833)
+        at java.base/java.util.concurrent.ThreadPoolExecutor.execute(ThreadPoolExecutor.java:1365)
+        at org.apache.spark.scheduler.TaskResultGetter.enqueueFailedTask(TaskResultGetter.scala:140)
+        at org.apache.spark.scheduler.TaskSchedulerImpl.statusUpdate(TaskSchedulerImpl.scala:810)
+        at org.apache.spark.scheduler.local.LocalEndpoint$$anonfun$receive$1.applyOrElse(LocalSchedulerBackend.scala:75)
+        at org.apache.spark.rpc.netty.Inbox.$anonfun$process$1(Inbox.scala:116)
+        at org.apache.spark.rpc.netty.Inbox.safelyCall(Inbox.scala:216)
+        at org.apache.spark.rpc.netty.Inbox.process(Inbox.scala:101)
+        at org.apache.spark.rpc.netty.MessageLoop.org$apache$spark$rpc$netty$MessageLoop$$receiveLoop(MessageLoop.scala:76)
+        at org.apache.spark.rpc.netty.MessageLoop$$anon$1.run(MessageLoop.scala:42)
+        at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1136)
+        at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:635)
+        at java.base/java.lang.Thread.run(Thread.java:842)
+26/08/30 21:51:15 ERROR TaskSchedulerImpl: Exception in statusUpdate
+java.util.concurrent.RejectedExecutionException: Task org.apache.spark.scheduler.TaskResultGetter$$Lambda$4984/0x0000016e021671a0@477e99b6 rejected from java.util.concurrent.ThreadPoolExecutor@50e3449c[Terminated, pool size = 0, active threads = 0, queued tasks = 0, completed tasks = 75]
+        at java.base/java.util.concurrent.ThreadPoolExecutor$AbortPolicy.rejectedExecution(ThreadPoolExecutor.java:2065)
+        at java.base/java.util.concurrent.ThreadPoolExecutor.reject(ThreadPoolExecutor.java:833)
+        at java.base/java.util.concurrent.ThreadPoolExecutor.execute(ThreadPoolExecutor.java:1365)
+        at org.apache.spark.scheduler.TaskResultGetter.enqueueFailedTask(TaskResultGetter.scala:140)
+        at org.apache.spark.scheduler.TaskSchedulerImpl.statusUpdate(TaskSchedulerImpl.scala:810)
+        at org.apache.spark.scheduler.local.LocalEndpoint$$anonfun$receive$1.applyOrElse(LocalSchedulerBackend.scala:75)
+        at org.apache.spark.rpc.netty.Inbox.$anonfun$process$1(Inbox.scala:116)
+        at org.apache.spark.rpc.netty.Inbox.safelyCall(Inbox.scala:216)
+        at org.apache.spark.rpc.netty.Inbox.process(Inbox.scala:101)
+        at org.apache.spark.rpc.netty.MessageLoop.org$apache$spark$rpc$netty$MessageLoop$$receiveLoop(MessageLoop.scala:76)
+        at org.apache.spark.rpc.netty.MessageLoop$$anon$1.run(MessageLoop.scala:42)
+        at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1136)
+        at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:635)
+        at java.base/java.lang.Thread.run(Thread.java:842)
+Traceback (most recent call last):
+  File "D:\Project1\phase2\sp5\sp5_run_test.py", line 192, in <module>
+    analyzer.process()
+  File "D:\Project1\phase2\sp5\performance.py", line 1437, in process
+    self.compare_cache_timings()
+  File "D:\Project1\phase2\sp5\performance.py", line 377, in compare_cache_timings
+    self._run_timed_action(
+  File "D:\Project1\phase2\sp5\performance.py", line 303, in _run_timed_action
+    df.count()
+  File "C:\Users\siva.manikandan\AppData\Local\Programs\Python\Python312\Lib\site-packages\pyspark\sql\classic\dataframe.py", line 499, in count
+    return int(self._jdf.count())
+               ^^^^^^^^^^^^^^^^^
+  File "C:\Users\siva.manikandan\AppData\Local\Programs\Python\Python312\Lib\site-packages\py4j\java_gateway.py", line 1362, in __call__
+    return_value = get_return_value(
+                   ^^^^^^^^^^^^^^^^^
+  File "C:\Users\siva.manikandan\AppData\Local\Programs\Python\Python312\Lib\site-packages\pyspark\errors\exceptions\captured.py", line 251, in deco
+    return f(*a, **kw)
+           ^^^^^^^^^^^
+  File "C:\Users\siva.manikandan\AppData\Local\Programs\Python\Python312\Lib\site-packages\py4j\protocol.py", line 327, in get_return_value
+    raise Py4JJavaError(
+py4j.protocol.Py4JJavaError: An error occurred while calling o31.count.
+: org.apache.spark.SparkException: Job aborted due to stage failure: Task 3 in stage 13.0 failed 1 times, most recent failure: Lost task 3.0 in stage 13.0 (TID 68) (C8LAP1840.prodapt.com executor driver): java.lang.OutOfMemoryError: Java heap space
+
+Driver stacktrace:
+        at org.apache.spark.scheduler.DAGScheduler.$anonfun$abortStage$3(DAGScheduler.scala:3318)
+        at scala.Option.getOrElse(Option.scala:201)
+        at org.apache.spark.scheduler.DAGScheduler.$anonfun$abortStage$2(DAGScheduler.scala:3318)
+        at org.apache.spark.scheduler.DAGScheduler.$anonfun$abortStage$2$adapted(DAGScheduler.scala:3310)
+        at scala.collection.immutable.List.foreach(List.scala:323)
+        at org.apache.spark.scheduler.DAGScheduler.abortStage(DAGScheduler.scala:3310)
+        at org.apache.spark.scheduler.DAGScheduler.$anonfun$handleTaskSetFailed$1(DAGScheduler.scala:1363)
+        at org.apache.spark.scheduler.DAGScheduler.$anonfun$handleTaskSetFailed$1$adapted(DAGScheduler.scala:1363)
+        at scala.Option.foreach(Option.scala:437)
+        at org.apache.spark.scheduler.DAGScheduler.handleTaskSetFailed(DAGScheduler.scala:1363)
+        at org.apache.spark.scheduler.DAGSchedulerEventProcessLoop.doOnReceive(DAGScheduler.scala:3589)
+        at org.apache.spark.scheduler.DAGSchedulerEventProcessLoop.onReceive(DAGScheduler.scala:3517)
+        at org.apache.spark.scheduler.DAGSchedulerEventProcessLoop.onReceive(DAGScheduler.scala:3506)
+        at org.apache.spark.util.EventLoop$$anon$1.run(EventLoop.scala:50)
+Caused by: java.lang.OutOfMemoryError: Java heap space
+
+PS D:\Project1\phase2\sp5> ERROR: The process with PID 5048 (child process of PID 2604) could not be terminated.
+Reason: The operation attempted is not supported.
+ERROR: The process with PID 2604 (child process of PID 24968) could not be terminated.
+Reason: There is no running instance of the task.
+SUCCESS: The process with PID 24968 (child process of PID 13496) has been terminated.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Yes — this is a **real memory problem in the SP5 cache experiment**, not a problem with the SP2/SP3/SP4 checkpoints.
+
+The key lines are:
+
+```text
+java.lang.OutOfMemoryError: Java heap space
+```
+
+and, more importantly:
+
+```text
+DefaultCachedBatchSerializer
+MemoryStore.putIterator
+CachedRDDBuilder
+```
+
+That tells us **SP5 is trying to cache too much data in JVM heap**.
+
+### What is happening
+
+Your SP5 experiment is doing something like:
+
+```text
+SP2 clean DataFrame
+        ↓
+.cache()
+        ↓
+count()
+        ↓
+Spark materializes the entire ~15 million row DataFrame
+        ↓
+memory fills
+        ↓
+GC pressure
+        ↓
+Java heap OOM
+```
+
+Your log confirms this:
+
+```text
+SP5 — CACHE TIMING EXPERIMENT
+```
+
+followed by:
+
+```text
+GCLocker ...
+```
+
+then:
+
+```text
+MemoryStore
+CachedRDDBuilder
+```
+
+and finally:
+
+```text
+OutOfMemoryError: Java heap space
+```
+
+So the failure occurs specifically while **materializing the cached DataFrame**, not during the normal SP5 validation.
+
+### Why this is especially bad locally
+
+You're running Spark locally on Windows. The SP2 checkpoint is roughly:
+
+```text
+15,089,165 rows
+```
+
+and it contains quite a few columns, including:
+
+```text
+timestamp
+grid_id
+country_code
+sms_in
+sms_out
+call_in
+call_out
+internet_activity
+input_file_name
+date
+hour
+day_of_week
+total_sms
+total_calls
+total_activity
+```
+
+Caching the **whole DataFrame** is therefore a very expensive experiment.
+
+The lab does **not** require us to cache the entire SP2 dataset.
+
+It says:
+
+> Cache a reused cleaned DataFrame and compare repeated action timings.
+
+We can satisfy that criterion much more safely by creating a **narrow, purpose-built DataFrame** containing only the columns needed for the repeated action.
+
+For example:
+
+```python
+cache_test_df = clean_network_df.select(
+    "timestamp",
+    "grid_id",
+    "total_activity"
+)
+```
+
+Then:
+
+```python
+cache_test_df.cache()
+cache_test_df.count()
+```
+
+This still demonstrates the concept of caching and repeated actions, but avoids trying to put the entire 15-million-row, 15-column dataset into memory.
+
+### There is another important point
+
+The lab explicitly asks you to demonstrate:
+
+* cache/persist
+* repeated action timing
+* column pruning
+* repartitioning
+* broadcast join
+* explain
+
+So **SP5 should be diagnostic, not "cache everything."**
+
+In fact, this failure itself is useful evidence for one of your performance observations:
+
+> **Observation:** Caching the full cleaned DataFrame on a local machine can be harmful because the cached representation exceeds available JVM heap, causing GC pressure and eventually `OutOfMemoryError`.
+
+That is excellent evidence for the lab's requirement that you **reject at least one optimization suggestion**.
+
+You can document:
+
+| Observation                                                           | Evidence                                                                                 |
+| --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Full-data caching is harmful locally                                  | `OutOfMemoryError: Java heap space` while `MemoryStore` was materializing cached batches |
+| Narrow column pruning is preferable for the experiment                | Cache only `timestamp`, `grid_id`, `total_activity`                                      |
+| Caching can help repeated actions when the cached dataset fits memory | Compare first vs subsequent action timings                                               |
+
+### I would NOT simply increase Spark memory
+
+You could increase:
+
+```text
+spark.driver.memory
+```
+
+but I **wouldn't make that the first fix**.
+
+The point of SP5 is to learn performance behavior. If we simply throw more memory at it, we hide the important lesson.
+
+Also, your machine is already showing significant memory pressure. Increasing the JVM heap could just make Windows start swapping instead.
+
+### What I recommend changing
+
+Only **SP5** needs changing.
+
+We should modify `performance.py` so the cache experiment:
+
+1. **does not cache the full SP2 DataFrame**
+2. uses a narrow projection
+3. measures uncached action
+4. caches the narrow DataFrame
+5. materializes it once
+6. measures a repeated action
+7. calls `unpersist()` immediately afterward
+8. records the timings
+9. keeps the rest of the SP5 experiments intact
+
+Something like:
+
+```text
+SP2 full checkpoint
+        │
+        ├── normal validation
+        │
+        └── cache experiment
+                │
+                └── select only required columns
+                       │
+                       ├── first action
+                       ├── cache
+                       ├── materialization
+                       ├── repeated action
+                       └── unpersist
+```
+
+That is much safer than:
+
+```text
+cache(all 15M rows)
+```
+
+And importantly, **we don't need to rerun SP2 → SP4**. Your checkpoints are already there.
+
+If you want, I can give you the **full corrected `performance.py` and `sp5_run_test.py`**, keeping all your existing SP5 acceptance criteria and outputs while fixing this OOM.
