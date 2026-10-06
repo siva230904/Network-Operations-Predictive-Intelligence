@@ -1,0 +1,475 @@
+DE5 – STORAGE STRATEGY
+
+Project: Telecom Network Intelligence Pipeline
+Phase: Data Engineering
+Module: DE5
+
+1. OBJECTIVE
+
+The telecom data platform uses separate storage zones for incoming data, validated raw data, static reference data, processed data, analytics outputs, and operational logs.
+
+The storage design separates immutable source data from transformed datasets and analytical outputs. Parquet is used for machine-to-machine checkpoints and processed datasets because the downstream Spark stages consume these datasets efficiently.
+
+The project storage structure is:
+
+D:\Project1\data
+landing
+raw
+rejected
+reference
+processed
+analytics
+logs\
+
+2. STORAGE ZONES
+
+2.1 LANDING ZONE
+
+Location:
+
+data/landing/
+
+Purpose:
+
+The landing zone receives incoming telecom CSV files before they are validated by DE2.
+
+Format:
+
+CSV
+
+Write mode:
+
+New incoming files are added without modifying previously received source files.
+
+Retention:
+
+Files remain available until the ingestion process has successfully validated and routed them according to the ingestion policy.
+
+The landing zone represents the boundary between external source delivery and the internal data pipeline.
+
+2.2 RAW ZONE
+
+Location:
+
+data/raw/
+
+Purpose:
+
+The raw zone contains accepted source CSV files after DE2 validation.
+
+Format:
+
+CSV
+
+Write mode:
+
+Append / immutable.
+
+Accepted files are preserved as source records and are not modified by downstream processing.
+
+Retention:
+
+Raw data should be retained for traceability, auditability, and safe pipeline reruns.
+
+Keeping the accepted raw files makes it possible to reproduce downstream processing without requiring the original external source delivery.
+
+2.3 REJECTED / QUARANTINE ZONE
+
+Location:
+
+data/rejected/
+
+Purpose:
+
+The rejected zone contains files that fail DE2 validation or minimum-quality checks.
+
+Format:
+
+Original CSV file where applicable, together with the DE2 audit information.
+
+Write mode:
+
+New rejected files are added as validation failures occur.
+
+Retention:
+
+Rejected files should be retained for troubleshooting and audit purposes until they are no longer required.
+
+Each rejection is recorded in the DE2 audit log with the filename, status, row count, reason, and processing timestamp.
+
+2.4 REFERENCE ZONE
+
+Location:
+
+data/reference/
+
+Example:
+
+data/reference/milano-grid.geojson
+
+Purpose:
+
+The reference zone stores static geographic reference data used to enrich network activity with grid geometry.
+
+Format:
+
+GeoJSON
+
+Write mode:
+
+Replace only when the reference dataset itself is intentionally updated.
+
+Retention:
+
+Long-lived. The reference dataset is not treated as daily transactional data.
+
+Partitioning:
+
+No date partitioning.
+
+Reason:
+
+The GeoJSON is a static reference dataset rather than a time-series activity dataset. Partitioning it by processing date would create unnecessary duplication and would not represent the business meaning of the data.
+
+The reference file is consumed by SP4 geospatial enrichment and is kept separate from the raw telecom activity files.
+
+3. PROCESSED ZONE
+
+Location:
+
+data/processed/
+
+Purpose:
+
+The processed zone stores cleaned and transformed datasets that are suitable for downstream analytical processing.
+
+Format:
+
+Parquet
+
+Write mode:
+
+Overwrite for a defined output/checkpoint dataset when the pipeline is intentionally rebuilding that dataset.
+
+The source raw data remains immutable, so rebuilding processed data does not destroy the original source.
+
+Partitioning:
+
+Date-based partitioning is used for time-series processed activity where appropriate.
+
+Example:
+
+data/processed/activity/
+
+The processed activity dataset is partitioned by:
+
+date
+
+This allows downstream processing to work with relevant date partitions rather than treating the complete dataset as a single undifferentiated file set.
+
+4. ANALYTICS ZONE
+
+Location:
+
+data/analytics/
+
+Purpose:
+
+The analytics zone contains curated datasets intended for analytical consumption, dashboards, and downstream applications.
+
+Format:
+
+Parquet for machine-readable analytical datasets.
+
+CSV may also be produced for human-readable dashboard or lab deliverables where required.
+
+Examples:
+
+data/analytics/hourly_grid_summary/
+
+data/analytics/dashboard_summary/
+
+The hourly grid summary is an analytical dataset at:
+
+grid_id + timestamp
+
+grain.
+
+Partitioning:
+
+Time-based partitioning may be used for large processed time-series datasets where it provides operational benefit.
+
+Small summary datasets do not require unnecessary partitioning.
+
+Write mode:
+
+Overwrite is appropriate when regenerating a complete derived analytical dataset from the current source period.
+
+Because the analytics layer is derived data, it can be rebuilt from the retained raw data and processing checkpoints.
+
+5. PIPELINE CHECKPOINTS
+
+Parquet checkpoints are an intentional part of the project architecture.
+
+They prevent every downstream stage from having to recompute the complete upstream transformation chain.
+
+SP2 produces a cleaning checkpoint:
+
+data/landing/sp2/clean_network
+
+SP3 produces Parquet checkpoints including:
+
+data/landing/sp3/hourly_grid_summary
+data/landing/sp3/daily_traffic_summary
+data/landing/sp3/hotspot_ranking
+data/landing/sp3/peak_activity_hour
+
+SP4 produces the geospatial enrichment checkpoint:
+
+data/landing/sp4/grid_activity_geo
+
+These checkpoints provide machine-to-machine handoff between pipeline stages.
+
+The checkpoint pattern is:
+
+SP2
+|
+| Parquet
+v
+SP3
+|
+| Parquet
+v
+SP4
+|
+| Parquet
+v
+Downstream processing
+
+6. LOG STORAGE
+
+Location:
+
+data/logs/
+
+Purpose:
+
+The logs zone stores operational and audit information generated by the pipeline.
+
+Examples include:
+
+DE2 ingestion audit records
+
+Spark pipeline execution logs
+
+SP2/SP3/SP4 processing logs
+
+Airflow-related execution information where persisted by the project
+
+Format:
+
+CSV, JSON, and text/log formats depending on the component.
+
+Write mode:
+
+Append for audit and execution history.
+
+Retention:
+
+Logs should be retained according to the operational audit requirement and should not be overwritten during normal pipeline reruns.
+
+Pipeline status records should identify the run and its outcome so that successful and failed executions can be distinguished.
+
+7. PARTITIONING STRATEGY
+
+Partitioning is applied only where it provides value.
+
+Processed time-series data:
+
+Partition by date.
+
+Reason:
+
+The telecom activity dataset is time-oriented and downstream processing commonly operates over daily periods.
+
+Static reference data:
+
+No partitioning.
+
+Reason:
+
+The GeoJSON reference dataset is static and does not have a natural daily partitioning requirement.
+
+Small analytical summaries:
+
+No unnecessary partitioning.
+
+Reason:
+
+Creating many small partitions can add filesystem overhead without improving query performance.
+
+8. WRITE MODE STRATEGY
+
+Raw source:
+
+APPEND / IMMUTABLE
+
+Accepted source files are preserved and are not overwritten.
+
+Rejected files:
+
+ADD / RETAIN
+
+Failed files are retained for audit and troubleshooting.
+
+Reference:
+
+REPLACE ONLY WHEN THE REFERENCE DATASET IS INTENTIONALLY UPDATED
+
+Processed datasets:
+
+OVERWRITE WHEN REBUILDING A DERIVED DATASET
+
+Because processed data is derived from immutable raw data, it can safely be regenerated.
+
+Analytics:
+
+OVERWRITE WHEN REBUILDING THE COMPLETE DERIVED OUTPUT
+
+This prevents stale records from remaining in a rebuilt analytical dataset.
+
+Logs:
+
+APPEND
+
+Execution history must remain available for troubleshooting and auditing.
+
+9. RETENTION STRATEGY
+
+Raw data has the strongest retention requirement because it represents the accepted source data and provides reproducibility.
+
+Recommended retention priorities:
+
+Raw:
+Long-term retention for reproducibility and audit.
+
+Rejected:
+Retain until validation issues have been investigated and the files are no longer needed.
+
+Reference:
+Long-term retention while the reference version is active.
+
+Processed:
+Retain according to downstream requirements because it can be regenerated from raw data.
+
+Analytics:
+Retain according to dashboard and analytical requirements because it is derived data.
+
+Logs:
+Retain according to operational and audit requirements.
+
+10. STORAGE FLOW
+
+The complete storage flow is:
+
+External daily CSV files
+|
+v
+data/landing/
+|
+| DE2 validation
++--------------------+
+|                    |
+v                    v
+data/raw/          data/rejected/
+|
+v
+SP2
+|
+v
+SP2 Parquet checkpoint
+|
+v
+SP3
+|
+v
+SP3 Parquet checkpoints
+|
+v
+SP4
+|
+v
+SP4 Parquet checkpoint
+|
++--------------------+
+|                    |
+v                    v
+data/processed/       data/analytics/
+|
++--------------------+
+|
+v
+Dashboard / ML
+
+Static reference data follows a separate path:
+
+data/reference/milano-grid.geojson
+|
+v
+SP4
+|
+v
+Geographic enrichment
+
+11. STORAGE DESIGN RATIONALE
+
+The storage architecture separates data according to its role:
+
+Landing:
+Incoming source delivery.
+
+Raw:
+Validated and immutable source records.
+
+Rejected:
+Files that failed validation.
+
+Reference:
+Static geographic reference data.
+
+Processed:
+Cleaned and transformed Parquet datasets.
+
+Analytics:
+Curated datasets for analytical consumption.
+
+Logs:
+Operational history and audit information.
+
+This separation improves traceability and allows individual processing stages to be rerun without unnecessarily reprocessing every previous stage.
+
+12. FINAL STORAGE STRATEGY
+
+The final storage strategy is:
+
+Zone             Format              Partitioning       Write Strategy
+
+Landing          CSV                 None               New files
+
+Raw              CSV                 None               Append / immutable
+
+Rejected         CSV + audit         None               Add / retain
+
+Reference        GeoJSON              None               Controlled replacement
+
+Processed        Parquet              Date               Controlled overwrite
+
+Analytics        Parquet / CSV       As appropriate     Derived-output overwrite
+
+Logs             CSV / JSON / logs   None               Append
+
+The architecture uses immutable raw data as the reproducible source of truth, Parquet as the primary machine-to-machine processing and checkpoint format, and separate analytics storage for curated outputs.
+
+Date partitioning is applied to time-series processed data, while static reference data remains non-partitioned.
+
+The storage strategy therefore supports reproducibility, downstream processing, efficient checkpointing, auditability, and safe pipeline reruns without modifying the original source data.

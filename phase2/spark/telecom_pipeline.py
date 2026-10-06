@@ -72,7 +72,7 @@ for directory in [
 
 
 from cleaning2 import NetworkCleaner
-from aggregation2 import NetworkAggregator
+from aggregation3 import NetworkAggregator
 from enrichment3 import NetworkGeoEnricher
 
 
@@ -1199,11 +1199,11 @@ def main():
         )
         .config(
             "spark.driver.memory",
-            "4g"
+            "2g"
         )
         .config(
             "spark.executor.memory",
-            "4g"
+            "2g"
         )
         .getOrCreate()
     )

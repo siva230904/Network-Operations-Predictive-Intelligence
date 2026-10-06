@@ -1,6 +1,6 @@
 # =========================================================
 # SP3 — Network Activity Aggregations
-# File: phase2/sp3/aggregation2.py
+# File: phase2/sp3/aggregation3.py
 # =========================================================
 
 import logging

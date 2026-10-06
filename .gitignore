@@ -1,70 +1,528 @@
 # =========================================================
-# Python virtual environment
+# PROJECT DATA & SENSITIVE CONTENT - NEVER COMMIT
 # =========================================================
 
-.venv/
-
-
-# =========================================================
-# Python cache
-# =========================================================
-
-__pycache__/
-*.pyc
-.pytest_cache/
-
-
-# =========================================================
-# Environment variables / secrets
-# =========================================================
-
-.env
-.env.*
-
-
-# =========================================================
-# VS Code / IDE
-# =========================================================
-
-.vscode/
-.idea/
-
-
-# =========================================================
-# Large / generated datasets
-# =========================================================
-
+# *** ALL DATA DIRECTORIES ***
+data/
+data/**/*
 data/raw/
+data/raw/**/*
 data/landing/
+data/landing/**/*
 data/processed/
+data/processed/**/*
 data/analytics/
+data/analytics/**/*
 data/sp7/
-
-phase_3/data/raw/
-phase_3/data/landing/
-phase_3/data/processed/
-phase_3/data/analytics/
-phase_3/data/sp7/
-
-
-# =========================================================
-# Logs
-# =========================================================
-
-logs/
-*.log
-
+data/sp7/**/*
+data/rejected/
+data/rejected/**/*
 data/logs/
+data/logs/**/*
+data/logs/**/*.log
+data/logs/**/*.json
+
+# Phase 3 legacy paths
+phase_3/data/
+phase_3/data/**/*
 phase_3/logs/
-phase_3/logs/*.log
+phase_3/logs/**/*
+
+# CSV files (large data exports)
+*.csv
+*.CSV
+data/**/*.csv
+*.tsv
+*.xlsx
+*.xls
+
+# Database dumps and backups
+*.sql
+*.sql.bak
+*.sql.gz
+*.db
+*.sqlite
+*.sqlite3
+database_dump/
+backups/
+backup/
 
 
 # =========================================================
-# Spark / Hadoop generated files
+# ENVIRONMENT & CONFIGURATION SECRETS
 # =========================================================
 
-spark-warehouse/
+# Environment variable files - CRITICAL
+.env
+.env.local
+.env.*.local
+.env.development
+.env.test
+.env.production
+.env.staging
+.env.sample
+.env.example
+
+# Local configuration files
+config.local.py
+config.local.yml
+config.development.py
+settings.local.py
+local_settings.py
+*.local.py
+
+# Credentials and tokens
+.credentials
+credentials.json
+secrets.json
+api_keys.json
+*.key
+*.pem
+*.crt
+*.cer
+private_key
+public_key
+AWS_CREDENTIALS
+aws_credentials
+.aws/
+google_credentials.json
+gcloud_credentials.json
+
+# Database connection strings
+db_config.yml
+database.yml
+database.config.py
+secrets.yml
+secrets.yaml
+
+
+# =========================================================
+# PYTHON & VIRTUAL ENVIRONMENTS
+# =========================================================
+
+# Virtual environments - CRITICAL
+venv/
+env/
+ENV/
+.venv/
+.venv
+.env_venv
+airflow-env/
+airflow_env/
+python_env/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Pytest and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+coverage_badge.svg
+.tox/
+
+# IDE caches
+.idea/
+.idea/**/*
+.vscode/
+.vscode/**/*
+*.swp
+*.swo
+*~
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+.ipynb_checkpoints/**/*
+*_checkpoint.ipynb
+
+# Python egg distribution
+*.egg-info/
+.installed.cfg
+*.egg
+
+
+# =========================================================
+# NODE.JS & REACT (PHASE 5)
+# =========================================================
+
+node_modules/
+node_modules/**/*
+npm-debug.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.npm/
+
+# Vite and build outputs
+dist/
+.vite/
+.parcel-cache/
+build/
+.cache/
+
+# Environment files
+phase5/.env
+phase5/.env.local
+phase5/.env.*.local
+
+# ESLint cache
+.eslintcache
+
+
+# =========================================================
+# IDE & EDITOR CONFIGURATION
+# =========================================================
+
+# VS Code
+.vscode/
+.vscode/**/*
+.vscode/settings.json
+.vscode/extensions.json
+.vscode/launch.json
+.vscode/.history/
+*.code-workspace
+
+# JetBrains (PyCharm, IntelliJ)
+.idea/
+.idea/**/*
+*.iml
+*.iws
+*.ipr
+.project
+.pydevproject
+.settings/
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# Vim
+.vim/
+.netrwhist
+*.swp
+*.swo
+
+# Emacs
+\#*\#
+.\#*
+*~
+
+# General editor files
+*.tmp
+*.bak
+*.backup
+
+
+# =========================================================
+# MACHINE LEARNING & MODEL ARTIFACTS
+# =========================================================
+
+# ML model files
+phase6/ml/artifacts/*.joblib
+phase6/ml/artifacts/*.pkl
+phase6/ml/artifacts/*.h5
+phase6/ml/artifacts/*.pth
+phase6/ml/artifacts/*.pt
+phase6/ml/artifacts/*.onnx
+
+# ML comparison outputs (can be large)
+phase6/ml/artifacts/ml3_np3_comparison.csv
+phase6/ml/**/*.csv
+
+# ML training outputs
+phase6/ml/**/*.json
+!phase6/ml/*.md
+phase6/ml/**/*.log
+
+# Training checkpoints
+*.ckpt
+checkpoints/
+checkpoints/**/*
+.checkpoints/
+
+
+# =========================================================
+# AIRFLOW & ORCHESTRATION
+# =========================================================
+
+# Airflow home and database
+airflow/
+airflow/**/*
+airflow_home/
+$AIRFLOW_HOME/
+airflow.db
+airflow/airflow.db
+airflow/webserver_config.py
 airflow-home/
 
-# Hadoop temporary files if created locally
+# Airflow logs
+airflow/logs/
+airflow/logs/**/*
+
+
+# =========================================================
+# SPARK & BIG DATA
+# =========================================================
+
+# Spark generated files
+spark-warehouse/
+metastore_db/
+metastore_db/**/*
+.spark-staging/
+.spark-warehouse/
+
+# Hadoop files
+hadoop-win-utils/
+hadoop-win-utils/**/*
+.hadoop-tmp/
 tmp/
+tmp/**/*
+
+
+# =========================================================
+# LOGS & DEBUGGING
+# =========================================================
+
+# All log files
+logs/
+logs/**/*
+*.log
+*.LOG
+data/logs/
+data/logs/**/*
+phase3/logs/
+phase3/logs/**/*
+phase3/airflow/logs/
+de7_*.log
+pipeline_*.log
+
+# Debug outputs
+debug/
+debug/**/*
+debug.py
+debug_*.py
+
+
+# =========================================================
+# TEMPORARY & OS FILES
+# =========================================================
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.AppleDouble
+.LSOverride
+
+# Windows
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Temporary directories
+temp/
+temp/**/*
+tmp/
+tmp/**/*
+scratch/
+scratch/**/*
+temp_scripts/
+temp_scripts/**/*
+.tmp/
+
+# Backup files
+*.bak
+*.backup
+*.old
+*.orig
+*~
+*.swp
+
+# Archive files (optional - uncomment if needed)
+# *.zip
+# *.tar
+# *.tar.gz
+# *.rar
+
+
+# =========================================================
+# DOCKER & CONTAINERS
+# =========================================================
+
+# Docker compose overrides
+docker-compose.override.yml
+docker-compose.local.yml
+.dockerignore
+
+# Docker volumes
+docker_volumes/
+docker_data/
+.docker/
+
+
+# =========================================================
+# TEST & QUALITY ASSURANCE
+# =========================================================
+
+# Test outputs
+test-results/
+test_results/
+test_output/
+*.trx
+junit.xml
+
+# Coverage reports
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Linting and analysis reports
+lint-report.html
+report.json
+.sonarqube/
+.pylint/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+
+# =========================================================
+# CI/CD & BUILD ARTIFACTS
+# =========================================================
+
+# Build outputs
+*.o
+*.a
+*.so
+*.dylib
+build/
+dist/
+
+# CI/CD specific
+.travis/
+.gitlab-ci/
+.circleci/
+.github/workflows/secrets.yml
+.github/workflows/*.local.yml
+
+# Test executables
+test_*
+tests_*
+
+
+# =========================================================
+# PROJECT-SPECIFIC SENSITIVE CONTENT
+# =========================================================
+
+# Training/instructor materials (if sensitive)
+# Uncomment if needed:
+# trainer_materials/
+# training_docs/
+# solutions/
+# answers.md
+# questions.pdf
+
+# Large PDF files (if sensitive)
+# Uncomment if needed:
+# *.pdf
+# Phase 1 Project - Network Operations Predictive Intelligence - Trainer Guide 1.pdf
+
+# Development notes
+DEV_NOTES.md
+TODO_LOCAL.md
+NOTES.txt
+local_notes.md
+
+# Archive folder
+archive/
+archive/**/*
+
+
+# =========================================================
+# PACKAGE MANAGERS
+# =========================================================
+
+# Python lock files (optional - uncomment if strict versioning needed)
+# Pipfile.lock
+# poetry.lock
+# pip-compile-output
+
+# Node lock files (optional - uncomment if strict versioning needed)
+# package-lock.json
+# yarn.lock
+
+# Any generated requirements
+requirements.lock
+**/requirements*.lock
+
+
+# =========================================================
+# GIT SPECIFIC
+# =========================================================
+
+.gitignore.swp
+.gitignore.swo
+
+
+# =========================================================
+# EXCEPTION RULES (DO NOT IGNORE THESE FILES)
+# =========================================================
+
+# Force include important files even if matching rules above
+!.gitignore
+!.gitkeep
+!README.md
+!requirements.txt
+!package.json
+!setup.py
+!setup.cfg
+
+# Keep documentation and example files
+!.env.example
+!.env.sample
+!config.example.py
+!config.example.yml
+!docs/
+!docs/**/*.md
+
+# Keep source code
+!phase1/**/*.py
+!phase2/**/*.py
+!phase3/**/*.py
+!phase3/**/*.yml
+!phase4/**/*.py
+!phase4/**/*.json
+!phase5/src/**/*.jsx
+!phase5/src/**/*.js
+!phase5/src/**/*.jsx
+!phase5/vite.config.js
+!phase5/eslint.config.js
+!phase5/package.json
+!phase6/**/*.py
+!phase6/ML1plan.md
+
+# Keep reference data
+!data/reference/
+!data/reference/**/*
+
+# Keep configuration templates
+!phase3/de2/config.py
+!phase4/api/config.py
+!

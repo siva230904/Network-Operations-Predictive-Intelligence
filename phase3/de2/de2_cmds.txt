@@ -1,0 +1,119 @@
+((airflow-env) ) sivamanikandanc@C8LAP1840:/mnt/d/Project1$ cat > data/landing/sms-call-internet-mi-2099-01-01.csv <<'EOF'
+datetime,CellID,countrycode,smsin,smsout,callin,callout,internet
+2013-11-01 00:00:00,1,39,10,5,3,2,100
+2013-11-01 01:00:00,2,39,20,7,4,3,150
+2013-11-01 02:00:00,3,39,15,8,5,4,120
+EOF
+((airflow-env) ) sivamanikandanc@C8LAP1840:/mnt/d/Project1$ python -m phase3.de2.ingestion
+2026-09-06 13:10:03,548 | INFO | Detected 1 landing file(s).
+2026-09-06 13:10:03,548 | INFO | Detected: sms-call-internet-mi-2099-01-01.csv
+2026-09-06 13:10:03,552 | INFO | Processing landing file: sms-call-internet-mi-2099-01-01.csv
+2026-09-06 13:10:03,592 | INFO | Audit record written: sms-call-internet-mi-2099-01-01.csv | ACCEPTED | File validated and routed to raw.
+2026-09-06 13:10:03,592 | INFO | Accepted file routed to raw: /mnt/d/Project1/data/raw/sms-call-internet-mi-2099-01-01.csv
+2026-09-06 13:10:03,593 | INFO | DE2 ingestion summary: {'detected': 1, 'accepted': 1, 'rejected': 0, 'skipped': 0}
+
+============================================================
+DE2 LANDING → RAW INGESTION
+============================================================
+Detected:  1
+Accepted:  1
+Rejected:  0
+Skipped:   0
+
+Audit log: /mnt/d/Project1/data/logs/de2_ingestion_audit.csv
+============================================================
+((airflow-env) ) sivamanikandanc@C8LAP1840:/mnt/d/Project1$ ls -lh data/raw/sms-call-internet-mi-2099-01-01.csv
+ls -lh data/landing/sms-call-internet-mi-2099-01-01.csv
+-rwxrwxrwx 1 sivamanikandanc sivamanikandanc 179 Sep  6 13:09 data/raw/sms-call-internet-mi-2099-01-01.csv
+ls: cannot access 'data/landing/sms-call-internet-mi-2099-01-01.csv': No such file or directory
+((airflow-env) ) sivamanikandanc@C8LAP1840:/mnt/d/Project1$ cat data/logs/de2_ingestion_audit.csv
+filename,status,row_count,reason,processed_at
+sms-call-internet-mi-2099-01-01.csv,ACCEPTED,3,File validated and routed to raw.,2026-09-06T13:10:03.585775+00:00
+((airflow-env) ) sivamanikandanc@C8LAP1840:/mnt/d/Project1$ cat > data/landing/sms-call-internet-mi-2099-01-02.csv <<'EOF'
+datetime,CellID,countrycode,smsin,smsout,callin
+2013-11-01 00:00:00,1,39,10,5,3
+EOF
+((airflow-env) ) sivamanikandanc@C8LAP1840:/mnt/d/Project1$ python -m phase3.de2.ingestion
+2026-09-06 13:12:38,063 | INFO | Detected 1 landing file(s).
+2026-09-06 13:12:38,063 | INFO | Detected: sms-call-internet-mi-2099-01-02.csv
+2026-09-06 13:12:38,067 | INFO | Processing landing file: sms-call-internet-mi-2099-01-02.csv
+2026-09-06 13:12:38,093 | INFO | Audit record written: sms-call-internet-mi-2099-01-02.csv | REJECTED | Missing required columns: ['callout', 'internet']
+2026-09-06 13:12:38,094 | WARNING | Rejected file routed to: /mnt/d/Project1/data/rejected/sms-call-internet-mi-2099-01-02.csv
+2026-09-06 13:12:38,094 | INFO | DE2 ingestion summary: {'detected': 1, 'accepted': 0, 'rejected': 1, 'skipped': 0}
+
+============================================================
+DE2 LANDING → RAW INGESTION
+============================================================
+Detected:  1
+Accepted:  0
+Rejected:  1
+Skipped:   0
+
+Audit log: /mnt/d/Project1/data/logs/de2_ingestion_audit.csv
+============================================================
+((airflow-env) ) sivamanikandanc@C8LAP1840:/mnt/d/Project1$ ls -lh data/rejected/
+tail -n 5 data/logs/de2_ingestion_audit.csv
+total 0
+-rwxrwxrwx 1 sivamanikandanc sivamanikandanc 80 Sep  6 13:12 sms-call-internet-mi-2099-01-02.csv
+filename,status,row_count,reason,processed_at
+sms-call-internet-mi-2099-01-01.csv,ACCEPTED,3,File validated and routed to raw.,2026-09-06T13:10:03.585775+00:00
+sms-call-internet-mi-2099-01-02.csv,REJECTED,0,"Missing required columns: ['callout', 'internet']",2026-09-06T13:12:38.087581+00:00
+((airflow-env) ) sivamanikandanc@C8LAP1840:/mnt/d/Project1$ cat > data/landing/sms-call-internet-mi-2099-01-03.csv <<'EOF'
+datetime,CellID,countrycode,smsin,smsout,callin,callout,internet
+2013-11-01 00:00:00,1,39,-10,5,3,2,100
+EOF
+((airflow-env) ) sivamanikandanc@C8LAP1840:/mnt/d/Project1$ python -m phase3.de2.ingestion
+2026-09-06 13:13:18,329 | INFO | Detected 1 landing file(s).
+2026-09-06 13:13:18,329 | INFO | Detected: sms-call-internet-mi-2099-01-03.csv
+2026-09-06 13:13:18,332 | INFO | Processing landing file: sms-call-internet-mi-2099-01-03.csv
+2026-09-06 13:13:18,377 | INFO | Audit record written: sms-call-internet-mi-2099-01-03.csv | REJECTED | Negative activity values in smsin: 1
+2026-09-06 13:13:18,378 | WARNING | Rejected file routed to: /mnt/d/Project1/data/rejected/sms-call-internet-mi-2099-01-03.csv
+2026-09-06 13:13:18,378 | INFO | DE2 ingestion summary: {'detected': 1, 'accepted': 0, 'rejected': 1, 'skipped': 0}
+
+============================================================
+DE2 LANDING → RAW INGESTION
+============================================================
+Detected:  1
+Accepted:  0
+Rejected:  1
+Skipped:   0
+
+Audit log: /mnt/d/Project1/data/logs/de2_ingestion_audit.csv
+============================================================
+((airflow-env) ) sivamanikandanc@C8LAP1840:/mnt/d/Project1$ ls -lh data/rejected/
+tail -n 5 data/logs/de2_ingestion_audit.csv
+total 0
+-rwxrwxrwx 1 sivamanikandanc sivamanikandanc  80 Sep  6 13:12 sms-call-internet-mi-2099-01-02.csv
+-rwxrwxrwx 1 sivamanikandanc sivamanikandanc 104 Sep  6 13:13 sms-call-internet-mi-2099-01-03.csv
+filename,status,row_count,reason,processed_at
+sms-call-internet-mi-2099-01-01.csv,ACCEPTED,3,File validated and routed to raw.,2026-09-06T13:10:03.585775+00:00
+sms-call-internet-mi-2099-01-02.csv,REJECTED,0,"Missing required columns: ['callout', 'internet']",2026-09-06T13:12:38.087581+00:00
+sms-call-internet-mi-2099-01-03.csv,REJECTED,1,Negative activity values in smsin: 1,2026-09-06T13:13:18.370726+00:00
+((airflow-env) ) sivamanikandanc@C8LAP1840:/mnt/d/Project1$ cp data/raw/sms-call-internet-mi-2099-01-01.csv \
+   data/landing/sms-call-internet-mi-2099-01-01.csv
+((airflow-env) ) sivamanikandanc@C8LAP1840:/mnt/d/Project1$ python -m phase3.de2.ingestion
+2026-09-06 13:14:05,939 | INFO | Detected 1 landing file(s).
+2026-09-06 13:14:05,939 | INFO | Detected: sms-call-internet-mi-2099-01-01.csv
+2026-09-06 13:14:05,944 | INFO | Processing landing file: sms-call-internet-mi-2099-01-01.csv
+2026-09-06 13:14:05,965 | INFO | Audit record written: sms-call-internet-mi-2099-01-01.csv | SKIPPED | File with the same filename already exists in raw.
+2026-09-06 13:14:05,965 | INFO | Skipping already processed file: sms-call-internet-mi-2099-01-01.csv
+2026-09-06 13:14:05,965 | INFO | DE2 ingestion summary: {'detected': 1, 'accepted': 0, 'rejected': 0, 'skipped': 1}
+
+============================================================
+DE2 LANDING → RAW INGESTION
+============================================================
+Detected:  1
+Accepted:  0
+Rejected:  0
+Skipped:   1
+
+Audit log: /mnt/d/Project1/data/logs/de2_ingestion_audit.csv
+============================================================
+((airflow-env) ) sivamanikandanc@C8LAP1840:/mnt/d/Project1$ tail -n 5 data/logs/de2_ingestion_audit.csv
+filename,status,row_count,reason,processed_at
+sms-call-internet-mi-2099-01-01.csv,ACCEPTED,3,File validated and routed to raw.,2026-09-06T13:10:03.585775+00:00
+sms-call-internet-mi-2099-01-02.csv,REJECTED,0,"Missing required columns: ['callout', 'internet']",2026-09-06T13:12:38.087581+00:00
+sms-call-internet-mi-2099-01-03.csv,REJECTED,1,Negative activity values in smsin: 1,2026-09-06T13:13:18.370726+00:00
+sms-call-internet-mi-2099-01-01.csv,SKIPPED,0,File with the same filename already exists in raw.,2026-09-06T13:14:05.958799+00:00
+((airflow-env) ) sivamanikandanc@C8LAP1840:/mnt/d/Project1$ find data/reference -maxdepth 1 -type f -printf '%f\n'
+milano-grid.geojson

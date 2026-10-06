@@ -44,7 +44,6 @@ INPUT_PATH = (
 OUTPUT_PATH = (
     PROJECT_ROOT
     / "data"
-    / "sp7"
 )
 
 

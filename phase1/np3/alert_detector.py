@@ -367,168 +367,451 @@ class NetworkAlertGenerator:
     # =====================================================
     # 4. Build exact leave-one-out median baseline
     # =====================================================
-
-    def build_baseline(self):
+    #third version for ml
+    def build_baseline(
+        self,
+        bucket_columns=None,
+    ):
         """
-        Build the exact leave-one-out within-day median baseline.
+        Build a leave-one-out median baseline using
+        configurable grouping/bucketing columns.
 
-        For each grid/hour:
+        NP3 default:
+            bucket_columns=["grid_id"]
 
-            baseline =
-            median(total_activity for the same grid,
-            excluding the current hour)
+        ML4:
+            bucket_columns=["grid_id", "hour_of_day"]
 
-        Uses pandas only.
+        The current observation is excluded from its
+        own baseline.
+
+        Uses a vectorized sorted-rank approach and avoids
+        row-by-row Python loops.
         """
+
+        if bucket_columns is None:
+            bucket_columns = ["grid_id"]
+
+        if not isinstance(bucket_columns, list):
+            raise TypeError(
+                "bucket_columns must be a list."
+            )
+
+        if not bucket_columns:
+            raise ValueError(
+                "bucket_columns cannot be empty."
+            )
+
+        missing_columns = [
+            column
+            for column in bucket_columns
+            if column not in self.analytics_data.columns
+        ]
+
+        if missing_columns:
+            raise ValueError(
+                f"Missing baseline bucket columns: "
+                f"{missing_columns}"
+            )
+
+        # -----------------------------------------------------
+        # Prepare data
+        # -----------------------------------------------------
 
         df = (
             self.analytics_data
             .copy()
             .sort_values(
-                ["grid_id", "timestamp"]
+                bucket_columns + ["timestamp"]
             )
             .reset_index(drop=True)
         )
 
         # -----------------------------------------------------
-        # Validate that every grid has enough observations
+        # Number of observations in each bucket
         # -----------------------------------------------------
 
         group_sizes = (
-            df.groupby("grid_id")[
-                "total_activity"
-            ]
+            df.groupby(
+                bucket_columns,
+                sort=False
+            )["total_activity"]
             .transform("size")
         )
 
         if (group_sizes < 2).any():
-
             raise ValueError(
-                "Cannot calculate leave-one-out "
-                "median for a grid with fewer "
-                "than 2 observations."
+                "Cannot calculate leave-one-out median "
+                "for a bucket with fewer than 2 observations."
             )
 
         # -----------------------------------------------------
-        # Rank activity values within each grid.
+        # Rank activity inside each bucket.
         #
-        # method="first" gives every row a unique position,
-        # even when two activity values are identical.
+        # method="first" ensures unique ranks when values tie.
         # -----------------------------------------------------
 
         df["_activity_rank"] = (
-            df.groupby("grid_id")[
-                "total_activity"
-            ]
+            df.groupby(
+                bucket_columns,
+                sort=False
+            )["total_activity"]
             .rank(
                 method="first",
                 ascending=True
             )
-            .astype(int)
+            .astype("int64")
         )
 
         # -----------------------------------------------------
-        # For 24 observations:
+        # Create sorted lookup table.
         #
-        # After removing one observation, 23 remain.
+        # Each row represents:
         #
-        # The median is the 12th value.
-        #
-        # 1-based position = 12
-        # 0-based position = 11
-        # -----------------------------------------------------
-
-        n = group_sizes
-
-        median_position = (
-            (n - 2) // 2
-        ) + 1
-
-        # -----------------------------------------------------
-        # Determine which sorted position should be used
-        # after removing the current observation.
-        #
-        # If current rank is <= median position,
-        # the median shifts one position to the right.
-        # Otherwise it stays where it is.
-        # -----------------------------------------------------
-
-        df["_baseline_rank"] = (
-            median_position
-            + (
-                df["_activity_rank"]
-                <= median_position
-            ).astype(int)
-        )
-
-        # -----------------------------------------------------
-        # Create lookup table:
-        #
-        # grid_id + rank → activity
+        # bucket + rank -> activity value
         # -----------------------------------------------------
 
         lookup = (
             df[
-                [
-                    "grid_id",
+                bucket_columns
+                + [
                     "_activity_rank",
-                    "total_activity"
+                    "total_activity",
                 ]
             ]
             .rename(
                 columns={
-                    "_activity_rank":
-                        "_baseline_rank",
-                    "total_activity":
-                        "_baseline_value"
+                    "_activity_rank": "_lookup_rank",
+                    "total_activity": "_lookup_value",
                 }
             )
         )
 
         # -----------------------------------------------------
-        # Join the required replacement value.
+        # For leave-one-out median:
+        #
+        # After removing the current observation:
+        #
+        # remaining_n = n - 1
+        #
+        # Lower and upper median positions are calculated
+        # separately so both odd and even bucket sizes work.
         # -----------------------------------------------------
 
-        df = df.merge(
-            lookup,
-            on=[
-                "grid_id",
-                "_baseline_rank"
-            ],
-            how="left",
-            sort=False
+        remaining_n = group_sizes - 1
+
+        lower_position = (
+            (remaining_n + 1) // 2
+        )
+
+        upper_position = (
+            (remaining_n + 2) // 2
         )
 
         # -----------------------------------------------------
-        # Store baseline
+        # If the removed observation is before or at a median
+        # position, the lookup rank moves one place right.
+        # -----------------------------------------------------
+
+        lower_lookup_rank = (
+            lower_position
+            + (
+                df["_activity_rank"]
+                <= lower_position
+            ).astype("int64")
+        )
+
+        upper_lookup_rank = (
+            upper_position
+            + (
+                df["_activity_rank"]
+                <= upper_position
+            ).astype("int64")
+        )
+
+        # -----------------------------------------------------
+        # Store lookup ranks temporarily.
+        # -----------------------------------------------------
+
+        df["_lower_lookup_rank"] = (
+            lower_lookup_rank
+        )
+
+        df["_upper_lookup_rank"] = (
+            upper_lookup_rank
+        )
+
+        # -----------------------------------------------------
+        # Lower median lookup
+        # -----------------------------------------------------
+
+        lower_lookup = lookup.rename(
+            columns={
+                "_lookup_rank":
+                    "_lower_lookup_rank",
+                "_lookup_value":
+                    "_lower_value",
+            }
+        )
+
+        df = df.merge(
+            lower_lookup,
+            on=(
+                bucket_columns
+                + ["_lower_lookup_rank"]
+            ),
+            how="left",
+            sort=False,
+        )
+
+        # -----------------------------------------------------
+        # Upper median lookup
+        # -----------------------------------------------------
+
+        upper_lookup = lookup.rename(
+            columns={
+                "_lookup_rank":
+                    "_upper_lookup_rank",
+                "_lookup_value":
+                    "_upper_value",
+            }
+        )
+
+        df = df.merge(
+            upper_lookup,
+            on=(
+                bucket_columns
+                + ["_upper_lookup_rank"]
+            ),
+            how="left",
+            sort=False,
+        )
+
+        # -----------------------------------------------------
+        # Calculate median.
+        #
+        # For odd number of remaining observations:
+        # lower == upper, so this returns that value.
+        #
+        # For even number:
+        # average of the two middle values.
         # -----------------------------------------------------
 
         df["baseline_activity"] = (
-            df["_baseline_value"]
+            (
+                df["_lower_value"]
+                +
+                df["_upper_value"]
+            )
+            / 2.0
         )
 
         # -----------------------------------------------------
-        # Remove temporary columns
+        # Validate result
+        # -----------------------------------------------------
+
+        if df["baseline_activity"].isna().any():
+            raise ValueError(
+                "Baseline calculation produced "
+                "missing values."
+            )
+
+        if (
+            ~pd.Series(
+                df["baseline_activity"]
+            ).apply(pd.api.types.is_number)
+        ).any():
+            raise ValueError(
+                "Baseline calculation produced "
+                "non-numeric values."
+            )
+
+        # -----------------------------------------------------
+        # Remove temporary columns.
         # -----------------------------------------------------
 
         df = df.drop(
             columns=[
                 "_activity_rank",
-                "_baseline_rank",
-                "_baseline_value"
-            ]
+                "_lower_lookup_rank",
+                "_upper_lookup_rank",
+                "_lower_value",
+                "_upper_value",
+            ],
+            errors="ignore",
         )
 
         self.analytics_data = df
 
         self.logger.info(
-            "Built exact leave-one-out "
-            "within-day median baseline."
+            "Built leave-one-out median baseline "
+            "using buckets: %s",
+            bucket_columns,
         )
 
         return self.analytics_data
+    #second version of build_baseline() using pandas only.  This is simpler but slower than the NumPy version above.  It is currently used in the current pipeline.
+    # def build_baseline(self):
+    #     """
+    #     Build the exact leave-one-out within-day median baseline.
 
+    #     For each grid/hour:
 
+    #         baseline =
+    #         median(total_activity for the same grid,
+    #         excluding the current hour)
+
+    #     Uses pandas only.
+    #     """
+
+    #     df = (
+    #         self.analytics_data
+    #         .copy()
+    #         .sort_values(
+    #             ["grid_id", "timestamp"]
+    #         )
+    #         .reset_index(drop=True)
+    #     )
+
+    #     # -----------------------------------------------------
+    #     # Validate that every grid has enough observations
+    #     # -----------------------------------------------------
+
+    #     group_sizes = (
+    #         df.groupby("grid_id")[
+    #             "total_activity"
+    #         ]
+    #         .transform("size")
+    #     )
+
+    #     if (group_sizes < 2).any():
+
+    #         raise ValueError(
+    #             "Cannot calculate leave-one-out "
+    #             "median for a grid with fewer "
+    #             "than 2 observations."
+    #         )
+
+    #     # -----------------------------------------------------
+    #     # Rank activity values within each grid.
+    #     #
+    #     # method="first" gives every row a unique position,
+    #     # even when two activity values are identical.
+    #     # -----------------------------------------------------
+
+    #     df["_activity_rank"] = (
+    #         df.groupby("grid_id")[
+    #             "total_activity"
+    #         ]
+    #         .rank(
+    #             method="first",
+    #             ascending=True
+    #         )
+    #         .astype(int)
+    #     )
+
+    #     # -----------------------------------------------------
+    #     # For 24 observations:
+    #     #
+    #     # After removing one observation, 23 remain.
+    #     #
+    #     # The median is the 12th value.
+    #     #
+    #     # 1-based position = 12
+    #     # 0-based position = 11
+    #     # -----------------------------------------------------
+
+    #     n = group_sizes
+
+    #     median_position = (
+    #         (n - 2) // 2
+    #     ) + 1
+
+    #     # -----------------------------------------------------
+    #     # Determine which sorted position should be used
+    #     # after removing the current observation.
+    #     #
+    #     # If current rank is <= median position,
+    #     # the median shifts one position to the right.
+    #     # Otherwise it stays where it is.
+    #     # -----------------------------------------------------
+
+    #     df["_baseline_rank"] = (
+    #         median_position
+    #         + (
+    #             df["_activity_rank"]
+    #             <= median_position
+    #         ).astype(int)
+    #     )
+
+    #     # -----------------------------------------------------
+    #     # Create lookup table:
+    #     #
+    #     # grid_id + rank → activity
+    #     # -----------------------------------------------------
+
+    #     lookup = (
+    #         df[
+    #             [
+    #                 "grid_id",
+    #                 "_activity_rank",
+    #                 "total_activity"
+    #             ]
+    #         ]
+    #         .rename(
+    #             columns={
+    #                 "_activity_rank":
+    #                     "_baseline_rank",
+    #                 "total_activity":
+    #                     "_baseline_value"
+    #             }
+    #         )
+    #     )
+
+    #     # -----------------------------------------------------
+    #     # Join the required replacement value.
+    #     # -----------------------------------------------------
+
+    #     df = df.merge(
+    #         lookup,
+    #         on=[
+    #             "grid_id",
+    #             "_baseline_rank"
+    #         ],
+    #         how="left",
+    #         sort=False
+    #     )
+
+    #     # -----------------------------------------------------
+    #     # Store baseline
+    #     # -----------------------------------------------------
+
+    #     df["baseline_activity"] = (
+    #         df["_baseline_value"]
+    #     )
+
+    #     # -----------------------------------------------------
+    #     # Remove temporary columns
+    #     # -----------------------------------------------------
+
+    #     df = df.drop(
+    #         columns=[
+    #             "_activity_rank",
+    #             "_baseline_rank",
+    #             "_baseline_value"
+    #         ]
+    #     )
+
+    #     self.analytics_data = df
+
+    #     self.logger.info(
+    #         "Built exact leave-one-out "
+    #         "within-day median baseline."
+    #     )
+
+    #     return self.analytics_data
+
+    #first version of build_baseline() using NumPy for speed.  This is more complex but faster than the pandas-only version above.  It is currently commented out because it is not being used in the current pipeline.
     # def build_baseline(self):
     #     """
     #     Build the exact leave-one-out within-day median baseline.

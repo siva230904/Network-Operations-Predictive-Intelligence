@@ -1,9 +1,13 @@
 from alert_detector import NetworkAlertGenerator
 
-
+# used first for testing, then for production.  The first file is a subset of the second.
+# analytics_file = (
+#     "../../data/landing/"
+#     "sms-call-internet-mi-2013-11-01_hourly_grid_summary.csv"
+# )
 analytics_file = (
     "../../data/landing/"
-    "sms-call-internet-mi-2013-11-01_hourly_grid_summary.csv"
+    "hourly_grid_summary.csv"
 )
 
 alert_generator = NetworkAlertGenerator(
